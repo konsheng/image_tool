@@ -1,0 +1,39 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build output
+build/
+dist/
+*.egg-info/
+
+# PyInstaller temporary files
+*.manifest
+*.toc
+*.pkg
+
+# Local settings and logs
+*.log
+process_log.txt
+.env
+.env.*
+
+# Test and smoke output
+_health_*/
+_watermark_*/
+_custom_watermark_*/
+_angle_*/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

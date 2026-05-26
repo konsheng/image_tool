@@ -1,0 +1,5 @@
+PySide6>=6.11.1
+PySide6-Fluent-Widgets>=1.11.2
+Pillow>=11.3.0
+PyInstaller>=6.17.0
+

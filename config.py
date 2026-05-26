@@ -1,0 +1,62 @@
+APP_NAME = "图片处理工具"
+APP_AUTHOR = "Konsheng"
+APP_VERSION = "v1.0.0"
+
+OUTPUT_SIZE_PRESETS = [
+    (800, 800),
+    (1000, 1000),
+    (1200, 1200),
+    (1440, 1440),
+    (1920, 1920),
+]
+DEFAULT_OUTPUT_SIZE = (1440, 1440)
+CUSTOM_SIZE_LABEL = "自定义"
+
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+OUTPUT_FORMATS = ["JPG", "PNG", "WEBP", "保持原格式"]
+DEFAULT_OUTPUT_FORMAT = "JPG"
+KEEP_ORIGINAL_FORMAT = "保持原格式"
+
+TARGET_SIZE_OPTIONS = {
+    "1MB以内": 1_000_000,
+    "2MB以内": 2_000_000,
+    "3MB以内": 3_000_000,
+}
+DEFAULT_TARGET_SIZE_LABEL = "3MB以内"
+
+QUALITY_STEPS = [95, 90, 85, 80, 75, 70, 65, 60]
+PNG_PALETTE_COLORS = [256, 224, 192, 160, 128]
+
+WATERMARK_TYPE_TEXT = "文字水印"
+WATERMARK_TYPE_IMAGE = "图片水印"
+WATERMARK_TYPES = [WATERMARK_TYPE_TEXT, WATERMARK_TYPE_IMAGE]
+WATERMARK_POSITIONS = ["左上", "右上", "左下", "右下", "居中", "平铺"]
+DEFAULT_WATERMARK_TEXT = "Konsheng"
+DEFAULT_WATERMARK_POSITION = "右下"
+DEFAULT_WATERMARK_OPACITY = 35
+DEFAULT_WATERMARK_MARGIN = 40
+DEFAULT_WATERMARK_FONT_SIZE = 48
+DEFAULT_WATERMARK_IMAGE_SCALE = 20
+DEFAULT_WATERMARK_ANGLE = 0
+WATERMARK_COLORS = {
+    "灰色": (102, 102, 102),
+    "白色": (255, 255, 255),
+    "黑色": (0, 0, 0),
+    "红色": (209, 52, 56),
+    "蓝色": (0, 120, 212),
+}
+DEFAULT_WATERMARK_COLOR = "灰色"
+
+STATUS_PENDING = "待处理"
+STATUS_PROCESSING = "处理中"
+STATUS_SUCCESS = "成功"
+STATUS_FAILED = "失败"
+STATUS_EXCEEDED = "超出大小"
+STATUS_CANCELED = "已取消"
+
+TABLE_HEADERS = ["文件名", "格式", "尺寸", "大小", "状态"]
+
+
+def size_to_text(size: tuple[int, int]) -> str:
+    return f"{size[0]}×{size[1]} px"
