@@ -143,3 +143,26 @@ python -m PyInstaller --noconfirm --clean image_tool.spec
 ```text
 dist/图片处理工具.exe
 ```
+
+## GitHub Actions 发布
+
+仓库包含 Release 工作流，支持推送 `v*` 标签自动发布，也支持在 GitHub Actions 页面手动运行。
+
+自动发布示例：
+
+```bat
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+手动发布：
+
+1. 打开 GitHub 仓库的 Actions 页面
+2. 选择 `Release`
+3. 点击 `Run workflow`
+4. 输入版本标签，例如 `v1.0.1`
+
+Release 会上传：
+
+- `图片处理工具.exe`
+- `图片处理工具-版本号-windows.zip`
