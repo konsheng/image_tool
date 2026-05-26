@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Iterable
 
 from PIL import Image
-from PySide6.QtCore import QEasingCurve, QObject, QSettings, QSize, Qt, QThread, QUrl, Signal, QVariantAnimation
-from PySide6.QtGui import QColor, QCursor, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon, QPalette, QPixmap
+from PySide6.QtCore import QEasingCurve, QObject, QPoint, QRect, QSettings, QSize, Qt, QThread, QUrl, Signal, QVariantAnimation
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon, QMouseEvent, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -60,9 +60,15 @@ from config import (
     DEFAULT_WATERMARK_FONT_SIZE,
     DEFAULT_WATERMARK_IMAGE_SCALE,
     DEFAULT_WATERMARK_MARGIN,
+    DEFAULT_WATERMARK_OFFSET_X,
+    DEFAULT_WATERMARK_OFFSET_Y,
     DEFAULT_WATERMARK_OPACITY,
     DEFAULT_WATERMARK_POSITION,
     DEFAULT_WATERMARK_TEXT,
+    DEFAULT_WATERMARK_TILE_OFFSET_X,
+    DEFAULT_WATERMARK_TILE_OFFSET_Y,
+    DEFAULT_WATERMARK_TILE_SPACING_X,
+    DEFAULT_WATERMARK_TILE_SPACING_Y,
     DEFAULT_OUTPUT_FORMAT,
     DEFAULT_OUTPUT_SIZE,
     DEFAULT_TARGET_SIZE_LABEL,
@@ -78,6 +84,8 @@ from config import (
     TABLE_HEADERS,
     TARGET_SIZE_OPTIONS,
     WATERMARK_COLORS,
+    WATERMARK_POSITION_CUSTOM,
+    WATERMARK_POSITION_TILE,
     WATERMARK_POSITIONS,
     WATERMARK_TYPE_IMAGE,
     WATERMARK_TYPE_TEXT,
@@ -93,7 +101,15 @@ from file_utils import (
     is_supported_image,
     resolve_output_format,
 )
-from image_processor import ProcessOptions, WatermarkOptions, get_image_info, process_image, render_preview_image
+from image_processor import (
+    ProcessOptions,
+    WatermarkOptions,
+    create_watermark_layer,
+    get_image_info,
+    process_image,
+    render_preview_image,
+    watermark_position_for_layer,
+)
 from logo_manager import LogoAsset, list_logo_assets, load_logo_assets
 
 
@@ -231,6 +247,78 @@ def load_theme_value(settings: QSettings) -> str:
     return value if value in THEME_MAP else "light"
 
 
+class PreviewImageLabel(QLabel):
+    drag_started = Signal(int, int)
+    dragged = Signal(int, int)
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self._drag_enabled = False
+        self._dragging = False
+        self._image_size = QSize()
+        self._pixmap_size = QSize()
+
+    def set_drag_enabled(self, enabled: bool) -> None:
+        self._drag_enabled = enabled
+        self.setCursor(Qt.OpenHandCursor if enabled else Qt.ArrowCursor)
+
+    def set_preview_pixmap(self, pixmap: QPixmap, image_size: tuple[int, int]) -> None:
+        self._image_size = QSize(image_size[0], image_size[1])
+        self._pixmap_size = pixmap.size()
+        self.setPixmap(pixmap)
+
+    def clear_preview_state(self) -> None:
+        self._dragging = False
+        self._image_size = QSize()
+        self._pixmap_size = QSize()
+        self.set_drag_enabled(False)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton and self._drag_enabled:
+            point = self._image_point(event.position().toPoint())
+            if point is not None:
+                self._dragging = True
+                self.setCursor(Qt.ClosedHandCursor)
+                self.drag_started.emit(point.x(), point.y())
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._dragging:
+            point = self._image_point(event.position().toPoint())
+            if point is not None:
+                self.dragged.emit(point.x(), point.y())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            self.setCursor(Qt.OpenHandCursor if self._drag_enabled else Qt.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _image_point(self, widget_pos: QPoint) -> QPoint | None:
+        rect = self._pixmap_rect()
+        if rect.isNull() or not rect.contains(widget_pos):
+            return None
+
+        x = int((widget_pos.x() - rect.left()) * self._image_size.width() / rect.width())
+        y = int((widget_pos.y() - rect.top()) * self._image_size.height() / rect.height())
+        return QPoint(x, y)
+
+    def _pixmap_rect(self) -> QRect:
+        if self._image_size.isEmpty() or self._pixmap_size.isEmpty():
+            return QRect()
+
+        x = (self.width() - self._pixmap_size.width()) // 2
+        y = (self.height() - self._pixmap_size.height()) // 2
+        return QRect(x, y, self._pixmap_size.width(), self._pixmap_size.height())
+
+
 @dataclass
 class ImageListItem:
     path: Path
@@ -359,6 +447,8 @@ class ImageOperationPage(QWidget):
         self.size_lookup = {size_to_text(size): size for size in OUTPUT_SIZE_PRESETS}
         self.logo_assets: list[LogoAsset] = []
         self.watermark_image_path: Path | None = None
+        self.watermark_drag_delta = (0, 0)
+        self.current_preview_image_size: tuple[int, int] | None = None
 
         self.setAcceptDrops(True)
         self._setup_ui()
@@ -490,7 +580,7 @@ class ImageOperationPage(QWidget):
         preview_header.addWidget(self.preview_collapse_button)
         preview_layout.addLayout(preview_header)
 
-        self.preview_image_label = QLabel("请选择图片", self)
+        self.preview_image_label = PreviewImageLabel("请选择图片", self)
         self.preview_image_label.setObjectName("PreviewImage")
         self.preview_image_label.setAlignment(Qt.AlignCenter)
         self.preview_image_label.setMinimumSize(260, 260)
@@ -801,6 +891,45 @@ class ImageOperationPage(QWidget):
         common_row.addStretch(1)
         layout.addLayout(common_row)
 
+        offset_row = QHBoxLayout()
+        offset_row.addWidget(QLabel("X偏移", self))
+        self.watermark_offset_x_edit = LineEdit(self)
+        self.watermark_offset_x_edit.setText(str(DEFAULT_WATERMARK_OFFSET_X))
+        self.watermark_offset_x_edit.setFixedWidth(76)
+        offset_row.addWidget(self.watermark_offset_x_edit)
+        offset_row.addWidget(QLabel("Y偏移", self))
+        self.watermark_offset_y_edit = LineEdit(self)
+        self.watermark_offset_y_edit.setText(str(DEFAULT_WATERMARK_OFFSET_Y))
+        self.watermark_offset_y_edit.setFixedWidth(76)
+        offset_row.addWidget(self.watermark_offset_y_edit)
+        offset_row.addWidget(QLabel("px", self))
+        offset_row.addStretch(1)
+        layout.addLayout(offset_row)
+
+        tile_row = QHBoxLayout()
+        tile_row.addWidget(QLabel("水平间距", self))
+        self.watermark_tile_spacing_x_edit = LineEdit(self)
+        self.watermark_tile_spacing_x_edit.setText(str(DEFAULT_WATERMARK_TILE_SPACING_X))
+        self.watermark_tile_spacing_x_edit.setFixedWidth(70)
+        tile_row.addWidget(self.watermark_tile_spacing_x_edit)
+        tile_row.addWidget(QLabel("垂直间距", self))
+        self.watermark_tile_spacing_y_edit = LineEdit(self)
+        self.watermark_tile_spacing_y_edit.setText(str(DEFAULT_WATERMARK_TILE_SPACING_Y))
+        self.watermark_tile_spacing_y_edit.setFixedWidth(70)
+        tile_row.addWidget(self.watermark_tile_spacing_y_edit)
+        tile_row.addWidget(QLabel("起始X", self))
+        self.watermark_tile_offset_x_edit = LineEdit(self)
+        self.watermark_tile_offset_x_edit.setText(str(DEFAULT_WATERMARK_TILE_OFFSET_X))
+        self.watermark_tile_offset_x_edit.setFixedWidth(70)
+        tile_row.addWidget(self.watermark_tile_offset_x_edit)
+        tile_row.addWidget(QLabel("起始Y", self))
+        self.watermark_tile_offset_y_edit = LineEdit(self)
+        self.watermark_tile_offset_y_edit.setText(str(DEFAULT_WATERMARK_TILE_OFFSET_Y))
+        self.watermark_tile_offset_y_edit.setFixedWidth(70)
+        tile_row.addWidget(self.watermark_tile_offset_y_edit)
+        tile_row.addStretch(1)
+        layout.addLayout(tile_row)
+
         return card
 
     def _build_save_card(self) -> CardWidget:
@@ -891,10 +1020,19 @@ class ImageOperationPage(QWidget):
             self.watermark_color_combo.currentTextChanged.connect(self._refresh_preview)
             self.watermark_image_button.clicked.connect(self._choose_watermark_image)
             self.watermark_image_scale_edit.textChanged.connect(self._refresh_preview)
+            self.watermark_position_combo.currentTextChanged.connect(self._update_watermark_controls_state)
             self.watermark_position_combo.currentTextChanged.connect(self._refresh_preview)
             self.watermark_opacity_edit.textChanged.connect(self._refresh_preview)
             self.watermark_margin_edit.textChanged.connect(self._refresh_preview)
             self.watermark_angle_edit.textChanged.connect(self._refresh_preview)
+            self.watermark_offset_x_edit.textChanged.connect(self._refresh_preview)
+            self.watermark_offset_y_edit.textChanged.connect(self._refresh_preview)
+            self.watermark_tile_spacing_x_edit.textChanged.connect(self._refresh_preview)
+            self.watermark_tile_spacing_y_edit.textChanged.connect(self._refresh_preview)
+            self.watermark_tile_offset_x_edit.textChanged.connect(self._refresh_preview)
+            self.watermark_tile_offset_y_edit.textChanged.connect(self._refresh_preview)
+            self.preview_image_label.drag_started.connect(self._on_preview_watermark_drag_started)
+            self.preview_image_label.dragged.connect(self._on_preview_watermark_dragged)
 
     def _toggle_preview_sidebar(self, *_args) -> None:
         self.preview_collapse_requested.emit(not self.preview_collapsed)
@@ -1055,6 +1193,9 @@ class ImageOperationPage(QWidget):
         apply_watermark = self._get_apply_watermark()
         enabled = apply_watermark and not processing
         is_text = self.watermark_type_combo.currentText() == WATERMARK_TYPE_TEXT
+        position = self.watermark_position_combo.currentText()
+        is_tile = position == WATERMARK_POSITION_TILE
+        uses_margin = position not in {WATERMARK_POSITION_CUSTOM, WATERMARK_POSITION_TILE}
 
         if self.has_optional_watermark:
             self.watermark_checkbox.setEnabled(not processing)
@@ -1066,8 +1207,14 @@ class ImageOperationPage(QWidget):
         self.watermark_image_scale_edit.setEnabled(enabled and (not is_text))
         self.watermark_position_combo.setEnabled(enabled)
         self.watermark_opacity_edit.setEnabled(enabled)
-        self.watermark_margin_edit.setEnabled(enabled)
+        self.watermark_margin_edit.setEnabled(enabled and uses_margin)
         self.watermark_angle_edit.setEnabled(enabled)
+        self.watermark_offset_x_edit.setEnabled(enabled and not is_tile)
+        self.watermark_offset_y_edit.setEnabled(enabled and not is_tile)
+        self.watermark_tile_spacing_x_edit.setEnabled(enabled and is_tile)
+        self.watermark_tile_spacing_y_edit.setEnabled(enabled and is_tile)
+        self.watermark_tile_offset_x_edit.setEnabled(enabled and is_tile)
+        self.watermark_tile_offset_y_edit.setEnabled(enabled and is_tile)
 
     def _refresh_preview(self, *_args) -> None:
         if not hasattr(self, "preview_image_label"):
@@ -1112,7 +1259,7 @@ class ImageOperationPage(QWidget):
                     watermark_options=watermark_options,
                 ),
             )
-            self._set_preview_image(preview, self.items[row].path.name)
+            self._set_preview_image(preview, self.items[row].path.name, watermark_options)
         except Exception as exc:
             reason = str(exc) or "图片无法打开"
             if "内置LOGO" in reason:
@@ -1129,10 +1276,17 @@ class ImageOperationPage(QWidget):
 
     def _set_preview_message(self, message: str) -> None:
         self.preview_image_label.clear()
+        self.preview_image_label.clear_preview_state()
+        self.current_preview_image_size = None
         self.preview_image_label.setText(message)
         self.preview_info_label.setText("处理后效果")
 
-    def _set_preview_image(self, image: Image.Image, file_name: str) -> None:
+    def _set_preview_image(
+        self,
+        image: Image.Image,
+        file_name: str,
+        watermark_options: WatermarkOptions | None,
+    ) -> None:
         preview = image.copy()
         max_width = max(220, self.preview_image_label.width() - 24)
         max_height = max(220, self.preview_image_label.height() - 24)
@@ -1144,8 +1298,43 @@ class ImageOperationPage(QWidget):
         pixmap.loadFromData(buffer.getvalue(), "PNG")
 
         self.preview_image_label.setText("")
-        self.preview_image_label.setPixmap(pixmap)
+        self.preview_image_label.set_preview_pixmap(pixmap, image.size)
+        self.preview_image_label.set_drag_enabled(watermark_options is not None and self.worker is None)
+        self.current_preview_image_size = image.size
         self.preview_info_label.setText(f"{file_name}    {image.width}×{image.height}")
+
+    def _on_preview_watermark_drag_started(self, x: int, y: int) -> None:
+        options, error = self._get_watermark_options()
+        if error or options is None or self.current_preview_image_size is None:
+            return
+
+        if options.position == WATERMARK_POSITION_TILE:
+            self.watermark_drag_delta = (x - options.tile_offset_x, y - options.tile_offset_y)
+            return
+
+        layer = create_watermark_layer(self.current_preview_image_size, options)
+        current_x, current_y = watermark_position_for_layer(self.current_preview_image_size, layer.size, options)
+        self.watermark_drag_delta = (x - current_x, y - current_y)
+
+    def _on_preview_watermark_dragged(self, x: int, y: int) -> None:
+        options, error = self._get_watermark_options()
+        if error or options is None:
+            return
+
+        delta_x, delta_y = self.watermark_drag_delta
+        new_x = x - delta_x
+        new_y = y - delta_y
+
+        if options.position == WATERMARK_POSITION_TILE:
+            self._set_line_edit_int(self.watermark_tile_offset_x_edit, new_x)
+            self._set_line_edit_int(self.watermark_tile_offset_y_edit, new_y)
+        else:
+            if self.watermark_position_combo.currentText() != WATERMARK_POSITION_CUSTOM:
+                self.watermark_position_combo.setCurrentText(WATERMARK_POSITION_CUSTOM)
+            self._set_line_edit_int(self.watermark_offset_x_edit, new_x)
+            self._set_line_edit_int(self.watermark_offset_y_edit, new_y)
+
+        self._refresh_preview()
 
     def _build_list_item(self, path: Path) -> ImageListItem:
         try:
@@ -1457,15 +1646,37 @@ class ImageOperationPage(QWidget):
         if opacity is None:
             return None, "请输入正确的水印透明度"
 
-        margin = self._read_int_value(self.watermark_margin_edit, 0, 10000)
-        if margin is None:
-            return None, "请输入正确的水印边距"
-
         angle = self._read_int_value(self.watermark_angle_edit, -180, 180)
         if angle is None:
             return None, "请输入正确的水印角度"
 
         position = self.watermark_position_combo.currentText()
+        is_tile = position == WATERMARK_POSITION_TILE
+        uses_margin = position not in {WATERMARK_POSITION_CUSTOM, WATERMARK_POSITION_TILE}
+
+        margin = DEFAULT_WATERMARK_MARGIN
+        if uses_margin:
+            parsed_margin = self._read_int_value(self.watermark_margin_edit, 0, 10000)
+            if parsed_margin is None:
+                return None, "请输入正确的水印边距"
+            margin = parsed_margin
+
+        offset_x = self._read_int_value(self.watermark_offset_x_edit, -100000, 100000)
+        offset_y = self._read_int_value(self.watermark_offset_y_edit, -100000, 100000)
+        if not is_tile and (offset_x is None or offset_y is None):
+            return None, "请输入正确的水印偏移"
+
+        tile_spacing_x = self._read_int_value(self.watermark_tile_spacing_x_edit, 0, 10000)
+        tile_spacing_y = self._read_int_value(self.watermark_tile_spacing_y_edit, 0, 10000)
+        tile_offset_x = self._read_int_value(self.watermark_tile_offset_x_edit, -100000, 100000)
+        tile_offset_y = self._read_int_value(self.watermark_tile_offset_y_edit, -100000, 100000)
+        if is_tile and (
+            tile_spacing_x is None
+            or tile_spacing_y is None
+            or tile_offset_x is None
+            or tile_offset_y is None
+        ):
+            return None, "请输入正确的平铺参数"
 
         if watermark_type == WATERMARK_TYPE_TEXT:
             text = self.watermark_text_edit.text().strip()
@@ -1487,6 +1698,12 @@ class ImageOperationPage(QWidget):
                     margin=margin,
                     font_size=font_size,
                     angle=angle,
+                    offset_x=offset_x or 0,
+                    offset_y=offset_y or 0,
+                    tile_spacing_x=tile_spacing_x or 0,
+                    tile_spacing_y=tile_spacing_y or 0,
+                    tile_offset_x=tile_offset_x or 0,
+                    tile_offset_y=tile_offset_y or 0,
                 ),
                 None,
             )
@@ -1512,6 +1729,12 @@ class ImageOperationPage(QWidget):
                 margin=margin,
                 image_scale=image_scale,
                 angle=angle,
+                offset_x=offset_x or 0,
+                offset_y=offset_y or 0,
+                tile_spacing_x=tile_spacing_x or 0,
+                tile_spacing_y=tile_spacing_y or 0,
+                tile_offset_x=tile_offset_x or 0,
+                tile_offset_y=tile_offset_y or 0,
             ),
             None,
         )
@@ -1531,6 +1754,11 @@ class ImageOperationPage(QWidget):
         if value < minimum or value > maximum:
             return None
         return value
+
+    def _set_line_edit_int(self, edit: LineEdit, value: int) -> None:
+        previous = edit.blockSignals(True)
+        edit.setText(str(value))
+        edit.blockSignals(previous)
 
     def _set_processing_state(self, processing: bool) -> None:
         self.import_button.setEnabled(not processing)

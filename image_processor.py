@@ -6,7 +6,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
 from compressor import CompressionResult, compress_image_to_bytes, save_image_to_bytes
-from config import WATERMARK_TYPE_IMAGE, WATERMARK_TYPE_TEXT
+from config import WATERMARK_POSITION_CUSTOM, WATERMARK_POSITION_TILE, WATERMARK_TYPE_IMAGE, WATERMARK_TYPE_TEXT
 from file_utils import get_file_size
 
 
@@ -32,6 +32,12 @@ class WatermarkOptions:
     font_size: int = 48
     image_scale: int = 20
     angle: int = 0
+    offset_x: int = 0
+    offset_y: int = 0
+    tile_spacing_x: int = 80
+    tile_spacing_y: int = 80
+    tile_offset_x: int = 40
+    tile_offset_y: int = 40
 
 
 @dataclass(frozen=True)
@@ -156,24 +162,48 @@ def overlay_logos(image: Image.Image, logos: list[Image.Image]) -> Image.Image:
 def apply_watermark(image: Image.Image, options: WatermarkOptions) -> Image.Image:
     base = image.convert("RGBA")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    layer = create_watermark_layer(base.size, options)
 
-    if options.watermark_type == WATERMARK_TYPE_TEXT:
-        layer = _create_text_watermark_layer(options)
-    elif options.watermark_type == WATERMARK_TYPE_IMAGE:
-        layer = _create_image_watermark_layer(base.size, options)
+    if options.position == WATERMARK_POSITION_TILE:
+        _paste_tiled(
+            overlay,
+            layer,
+            max(0, options.tile_spacing_x),
+            max(0, options.tile_spacing_y),
+            options.tile_offset_x,
+            options.tile_offset_y,
+        )
     else:
-        return image
-
-    layer = _rotate_layer(layer, options.angle)
-
-    if options.position == "平铺":
-        _paste_tiled(overlay, layer, max(0, options.margin))
-    else:
-        x, y = _position_for_layer(base.size, layer.size, options.position, max(0, options.margin))
-        overlay.alpha_composite(layer, (x, y))
+        x, y = watermark_position_for_layer(base.size, layer.size, options)
+        _alpha_composite_clipped(overlay, layer, x, y)
 
     watermarked = Image.alpha_composite(base, overlay)
     return watermarked.convert("RGBA") if _has_alpha(image) else watermarked.convert("RGB")
+
+
+def create_watermark_layer(base_size: tuple[int, int], options: WatermarkOptions) -> Image.Image:
+    if options.watermark_type == WATERMARK_TYPE_TEXT:
+        layer = _create_text_watermark_layer(options)
+    elif options.watermark_type == WATERMARK_TYPE_IMAGE:
+        layer = _create_image_watermark_layer(base_size, options)
+    else:
+        return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    return _rotate_layer(layer, options.angle)
+
+
+def watermark_position_for_layer(
+    base_size: tuple[int, int],
+    layer_size: tuple[int, int],
+    options: WatermarkOptions,
+) -> tuple[int, int]:
+    return _position_for_layer(
+        base_size,
+        layer_size,
+        options.position,
+        max(0, options.margin),
+        options.offset_x,
+        options.offset_y,
+    )
 
 
 def _prepare_image(image: Image.Image, output_size: tuple[int, int] | None) -> Image.Image:
@@ -238,15 +268,31 @@ def _rotate_layer(layer: Image.Image, angle: int) -> Image.Image:
     )
 
 
-def _paste_tiled(overlay: Image.Image, layer: Image.Image, margin: int) -> None:
-    step_x = max(1, layer.width + margin * 2)
-    step_y = max(1, layer.height + margin * 2)
-    start_x = margin
-    start_y = margin
+def _paste_tiled(
+    overlay: Image.Image,
+    layer: Image.Image,
+    spacing_x: int,
+    spacing_y: int,
+    offset_x: int,
+    offset_y: int,
+) -> None:
+    step_x = max(1, layer.width + spacing_x)
+    step_y = max(1, layer.height + spacing_y)
+    start_x = offset_x
+    start_y = offset_y
 
-    for y in range(start_y, overlay.height, step_y):
-        for x in range(start_x, overlay.width, step_x):
-            overlay.alpha_composite(layer, (x, y))
+    while start_x > 0:
+        start_x -= step_x
+    while start_y > 0:
+        start_y -= step_y
+
+    y = start_y
+    while y < overlay.height:
+        x = start_x
+        while x < overlay.width:
+            _alpha_composite_clipped(overlay, layer, x, y)
+            x += step_x
+        y += step_y
 
 
 def _position_for_layer(
@@ -254,24 +300,49 @@ def _position_for_layer(
     layer_size: tuple[int, int],
     position: str,
     margin: int,
+    offset_x: int,
+    offset_y: int,
 ) -> tuple[int, int]:
     base_width, base_height = base_size
     layer_width, layer_height = layer_size
 
-    if position == "左上":
-        x, y = margin, margin
-    elif position == "右上":
-        x, y = base_width - layer_width - margin, margin
-    elif position == "左下":
-        x, y = margin, base_height - layer_height - margin
-    elif position == "居中":
-        x, y = (base_width - layer_width) // 2, (base_height - layer_height) // 2
-    else:
-        x, y = base_width - layer_width - margin, base_height - layer_height - margin
+    if position == WATERMARK_POSITION_CUSTOM:
+        return offset_x, offset_y
 
-    max_x = max(0, base_width - layer_width)
-    max_y = max(0, base_height - layer_height)
-    return max(0, min(x, max_x)), max(0, min(y, max_y))
+    if position in {"左上", "左中", "左下"}:
+        x = margin
+    elif position in {"上中", "居中", "下中"}:
+        x = (base_width - layer_width) // 2
+    else:
+        x = base_width - layer_width - margin
+
+    if position in {"左上", "上中", "右上"}:
+        y = margin
+    elif position in {"左中", "居中", "右中"}:
+        y = (base_height - layer_height) // 2
+    else:
+        y = base_height - layer_height - margin
+
+    return x + offset_x, y + offset_y
+
+
+def _alpha_composite_clipped(target: Image.Image, layer: Image.Image, x: int, y: int) -> None:
+    target_width, target_height = target.size
+    layer_width, layer_height = layer.size
+
+    left = max(0, x)
+    top = max(0, y)
+    right = min(target_width, x + layer_width)
+    bottom = min(target_height, y + layer_height)
+
+    if right <= left or bottom <= top:
+        return
+
+    crop_left = left - x
+    crop_top = top - y
+    crop_right = crop_left + (right - left)
+    crop_bottom = crop_top + (bottom - top)
+    target.alpha_composite(layer.crop((crop_left, crop_top, crop_right, crop_bottom)), (left, top))
 
 
 def _opacity_to_alpha(opacity: int) -> int:
