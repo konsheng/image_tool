@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -94,6 +94,7 @@ from config import (
 )
 from file_utils import (
     build_default_output_path,
+    build_output_file_stem,
     bytes_to_display,
     ensure_suffix,
     ensure_unique_path,
@@ -119,6 +120,12 @@ MODE_FORMAT = "format"
 MODE_COMPRESS = "compress"
 MODE_LOGO = "logo"
 MODE_WATERMARK = "watermark"
+
+LOGO_RULE_DEFAULT = "default"
+LOGO_RULE_NONE = "none"
+LOGO_RULE_CUSTOM = "custom"
+LOGO_COLUMN = 4
+STATUS_COLUMN = 5
 
 PREVIEW_SIDEBAR_EXPANDED_WIDTH = 340
 PREVIEW_SIDEBAR_COLLAPSED_WIDTH = 48
@@ -325,6 +332,8 @@ class ImageListItem:
     image_format: str
     dimensions: str
     size_text: str
+    logo_rule: str = LOGO_RULE_DEFAULT
+    logo_assets: list[LogoAsset] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -333,6 +342,8 @@ class ProcessingTask:
     source_path: Path
     output_path: Path
     output_format: str
+    apply_logo: bool
+    logo_assets: list[LogoAsset]
 
 
 @dataclass(frozen=True)
@@ -356,16 +367,14 @@ class ProcessingWorker(QObject):
         tasks: list[ProcessingTask],
         output_size: tuple[int, int] | None,
         target_size: int | None,
-        apply_logo: bool,
-        logos: list[Image.Image],
+        logo_cache: dict[str, Image.Image],
         watermark_options: WatermarkOptions | None,
     ) -> None:
         super().__init__()
         self.tasks = tasks
         self.output_size = output_size
         self.target_size = target_size
-        self.apply_logo = apply_logo
-        self.logos = logos
+        self.logo_cache = logo_cache
         self.watermark_options = watermark_options
         self.cancel_requested = False
 
@@ -385,7 +394,13 @@ class ProcessingWorker(QObject):
             self.item_started.emit(task.row, file_name)
 
             try:
-                logo_copies = [logo.copy() for logo in self.logos]
+                logo_copies: list[Image.Image] = []
+                if task.apply_logo:
+                    for asset in task.logo_assets:
+                        cached_logo = self.logo_cache.get(str(asset.path))
+                        if cached_logo is None:
+                            raise RuntimeError("内置LOGO加载失败")
+                        logo_copies.append(cached_logo.copy())
                 result = process_image(
                     task.source_path,
                     task.output_path,
@@ -393,7 +408,7 @@ class ProcessingWorker(QObject):
                         output_format=task.output_format,
                         output_size=self.output_size,
                         target_size=self.target_size,
-                        apply_logo=self.apply_logo,
+                        apply_logo=task.apply_logo,
                         logos=logo_copies,
                         watermark_options=self.watermark_options,
                     ),
@@ -480,6 +495,10 @@ class ImageOperationPage(QWidget):
         return self.mode == MODE_LOGO
 
     @property
+    def supports_logo_overrides(self) -> bool:
+        return self.has_optional_logo or self.always_apply_logo
+
+    @property
     def has_optional_watermark(self) -> bool:
         return self.mode == MODE_COMPREHENSIVE
 
@@ -519,9 +538,11 @@ class ImageOperationPage(QWidget):
         button_row = QHBoxLayout()
         button_row.setSpacing(10)
         self.import_button = self._create_button(PrimaryPushButton, "导入图片", FIF.ADD)
+        self.import_folder_button = self._create_button(PushButton, "导入文件夹", FIF.FOLDER)
         self.remove_button = self._create_button(PushButton, "移除选中", FIF.DELETE)
         self.clear_button = self._create_button(PushButton, "清空列表", FIF.CLEAR_SELECTION)
         button_row.addWidget(self.import_button)
+        button_row.addWidget(self.import_folder_button)
         button_row.addWidget(self.remove_button)
         button_row.addWidget(self.clear_button)
         button_row.addStretch(1)
@@ -542,7 +563,9 @@ class ImageOperationPage(QWidget):
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.Stretch)
+        header.setSectionResizeMode(LOGO_COLUMN, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(STATUS_COLUMN, QHeaderView.Stretch)
+        self.table.setColumnHidden(LOGO_COLUMN, not self.supports_logo_overrides)
         list_layout.addWidget(self.table)
 
         self.preview_collapsed = False
@@ -606,17 +629,17 @@ class ImageOperationPage(QWidget):
 
         layout.addWidget(list_card)
 
-        settings_row = QHBoxLayout()
-        settings_row.setSpacing(14)
-        settings_row.addWidget(self._build_output_card(), 2)
-        settings_row.addWidget(self._build_save_card(), 2)
-        layout.addLayout(settings_row)
-
         if self.has_optional_logo or self.always_apply_logo:
             layout.addWidget(self._build_logo_card())
 
         if self.has_optional_watermark or self.always_apply_watermark:
             layout.addWidget(self._build_watermark_card())
+
+        settings_row = QHBoxLayout()
+        settings_row.setSpacing(14)
+        settings_row.addWidget(self._build_output_card(), 2)
+        settings_row.addWidget(self._build_save_card(), 2)
+        layout.addLayout(settings_row)
 
         progress_card, progress_layout = self._create_card("处理进度")
         self.progress_text = QLabel("总数：0    当前：0/0    文件：-", self)
@@ -801,6 +824,17 @@ class ImageOperationPage(QWidget):
         self.logo_list.setSpacing(8)
         self._load_logo_grid()
         layout.addWidget(self.logo_list)
+
+        override_row = QHBoxLayout()
+        override_row.setSpacing(10)
+        self.logo_apply_selected_button = self._create_button(PushButton, "应用到选中图片", FIF.ACCEPT)
+        self.logo_disable_selected_button = self._create_button(PushButton, "选中图片不叠加", FIF.CANCEL)
+        self.logo_restore_default_button = self._create_button(PushButton, "恢复默认", FIF.RETURN)
+        override_row.addWidget(self.logo_apply_selected_button)
+        override_row.addWidget(self.logo_disable_selected_button)
+        override_row.addWidget(self.logo_restore_default_button)
+        override_row.addStretch(1)
+        layout.addLayout(override_row)
         return card
 
     def _build_watermark_card(self) -> CardWidget:
@@ -937,9 +971,9 @@ class ImageOperationPage(QWidget):
         self.save_group = QButtonGroup(self)
         self.choose_save_radio = RadioButton(self)
         self.choose_save_radio.setText("处理后选择保存位置")
-        self.choose_save_radio.setChecked(True)
         self.original_save_radio = RadioButton(self)
         self.original_save_radio.setText("保存到原图位置")
+        self.original_save_radio.setChecked(True)
         self.save_group.addButton(self.choose_save_radio)
         self.save_group.addButton(self.original_save_radio)
         layout.addWidget(self.choose_save_radio)
@@ -983,6 +1017,7 @@ class ImageOperationPage(QWidget):
 
     def _connect_signals(self) -> None:
         self.import_button.clicked.connect(self._select_images)
+        self.import_folder_button.clicked.connect(self._select_image_folder)
         self.remove_button.clicked.connect(self._remove_selected)
         self.clear_button.clicked.connect(self._clear_list)
         self.choose_save_button.clicked.connect(self._choose_save_location)
@@ -1009,6 +1044,9 @@ class ImageOperationPage(QWidget):
             self.logo_checkbox.stateChanged.connect(self._refresh_preview)
         if hasattr(self, "logo_list"):
             self.logo_list.itemSelectionChanged.connect(self._refresh_preview)
+            self.logo_apply_selected_button.clicked.connect(self._apply_current_logos_to_selected_images)
+            self.logo_disable_selected_button.clicked.connect(self._disable_logo_for_selected_images)
+            self.logo_restore_default_button.clicked.connect(self._restore_default_logo_for_selected_images)
         if self.has_optional_watermark:
             self.watermark_checkbox.stateChanged.connect(self._update_watermark_controls_state)
             self.watermark_checkbox.stateChanged.connect(self._refresh_preview)
@@ -1088,7 +1126,10 @@ class ImageOperationPage(QWidget):
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
-                if url.isLocalFile() and is_supported_image(url.toLocalFile()):
+                if not url.isLocalFile():
+                    continue
+                path = Path(url.toLocalFile())
+                if path.is_dir() or is_supported_image(path):
                     event.acceptProposedAction()
                     return
         event.ignore()
@@ -1108,37 +1149,64 @@ class ImageOperationPage(QWidget):
         if files:
             self._add_paths(files)
 
+    def _select_image_folder(self) -> None:
+        selected = QFileDialog.getExistingDirectory(self, "导入文件夹", "")
+        if selected:
+            self._add_paths([selected])
+
     def _add_paths(self, paths: Iterable[str]) -> None:
         existing = {str(item.path.resolve()).lower() for item in self.items}
         unsupported = False
+        empty_folder = False
         added = 0
         first_new_row = self.table.rowCount()
 
         for raw_path in paths:
             path = Path(raw_path)
-            if not path.is_file():
-                continue
-            if not is_supported_image(path):
-                unsupported = True
+            candidate_paths: list[Path]
+            if path.is_dir():
+                candidate_paths = self._folder_image_paths(path)
+                if not candidate_paths:
+                    empty_folder = True
+            elif path.is_file():
+                candidate_paths = [path]
+            else:
                 continue
 
-            normalized = str(path.resolve()).lower()
-            if normalized in existing:
-                continue
+            for path in candidate_paths:
+                if not is_supported_image(path):
+                    unsupported = True
+                    continue
 
-            item = self._build_list_item(path)
-            self.items.append(item)
-            existing.add(normalized)
-            self._append_table_row(item)
-            added += 1
+                normalized = str(path.resolve()).lower()
+                if normalized in existing:
+                    continue
+
+                item = self._build_list_item(path)
+                self.items.append(item)
+                existing.add(normalized)
+                self._append_table_row(item)
+                added += 1
 
         if unsupported:
             self._show_message("warning", "图片格式不支持")
+        if empty_folder:
+            self._show_message("warning", "文件夹中没有支持的图片")
         if added:
             self._reset_save_location()
             if not self.table.selectionModel().selectedRows():
                 self.table.selectRow(first_new_row)
             self._refresh_preview()
+
+    def _folder_image_paths(self, folder: Path) -> list[Path]:
+        try:
+            return [
+                path
+                for path in sorted(folder.iterdir(), key=lambda item: item.name.lower())
+                if path.is_file() and is_supported_image(path)
+            ]
+        except OSError:
+            return []
 
     def _load_logo_grid(self) -> None:
         self.logo_assets = list_logo_assets()
@@ -1162,7 +1230,57 @@ class ImageOperationPage(QWidget):
 
     def _update_logo_grid_state(self, *_args) -> None:
         if hasattr(self, "logo_list"):
-            self.logo_list.setEnabled(self._get_apply_logo())
+            self.logo_list.setEnabled(self.worker is None)
+        self._refresh_preview()
+
+    def _selected_table_rows(self) -> list[int]:
+        selection_model = self.table.selectionModel()
+        if selection_model is None:
+            return []
+        return sorted({index.row() for index in selection_model.selectedRows()})
+
+    def _apply_current_logos_to_selected_images(self, *_args) -> None:
+        rows = self._selected_table_rows()
+        if not rows:
+            self._show_message("warning", "请选择图片")
+            return
+
+        logo_assets = self._get_selected_logo_assets(respect_apply_logo=False)
+        if not logo_assets:
+            self._show_message("warning", "请选择LOGO")
+            return
+
+        for row in rows:
+            if 0 <= row < len(self.items):
+                self.items[row].logo_rule = LOGO_RULE_CUSTOM
+                self.items[row].logo_assets = list(logo_assets)
+                self._update_logo_cell(row)
+        self._refresh_preview()
+
+    def _disable_logo_for_selected_images(self, *_args) -> None:
+        rows = self._selected_table_rows()
+        if not rows:
+            self._show_message("warning", "请选择图片")
+            return
+
+        for row in rows:
+            if 0 <= row < len(self.items):
+                self.items[row].logo_rule = LOGO_RULE_NONE
+                self.items[row].logo_assets = []
+                self._update_logo_cell(row)
+        self._refresh_preview()
+
+    def _restore_default_logo_for_selected_images(self, *_args) -> None:
+        rows = self._selected_table_rows()
+        if not rows:
+            self._show_message("warning", "请选择图片")
+            return
+
+        for row in rows:
+            if 0 <= row < len(self.items):
+                self.items[row].logo_rule = LOGO_RULE_DEFAULT
+                self.items[row].logo_assets = []
+                self._update_logo_cell(row)
         self._refresh_preview()
 
     def _choose_watermark_image(self, *_args) -> None:
@@ -1235,8 +1353,7 @@ class ImageOperationPage(QWidget):
             self._set_preview_message("请输入正确的输出尺寸")
             return
 
-        apply_logo = self._get_apply_logo()
-        logo_assets = self._get_selected_logo_assets()
+        apply_logo, logo_assets = self._effective_logo_for_item(self.items[row])
         if apply_logo and not logo_assets:
             self._set_preview_message("请选择LOGO")
             return
@@ -1352,14 +1469,49 @@ class ImageOperationPage(QWidget):
     def _append_table_row(self, item: ImageListItem) -> None:
         row = self.table.rowCount()
         self.table.insertRow(row)
-        values = [item.path.name, item.image_format, item.dimensions, item.size_text, STATUS_PENDING]
+        values = [
+            item.path.name,
+            item.image_format,
+            item.dimensions,
+            item.size_text,
+            self._logo_display_text(item),
+            STATUS_PENDING,
+        ]
         for column, value in enumerate(values):
             table_item = QTableWidgetItem(value)
             table_item.setTextAlignment(Qt.AlignCenter if column else Qt.AlignVCenter | Qt.AlignLeft)
             if column == 0:
                 table_item.setData(Qt.UserRole, str(item.path))
+            if column == LOGO_COLUMN:
+                table_item.setToolTip(self._logo_tooltip_text(item))
             self.table.setItem(row, column, table_item)
         self.table.setRowHeight(row, 38)
+
+    def _logo_display_text(self, item: ImageListItem) -> str:
+        if not self.supports_logo_overrides:
+            return "-"
+        if item.logo_rule == LOGO_RULE_NONE:
+            return "不叠加"
+        if item.logo_rule == LOGO_RULE_CUSTOM:
+            return f"自定义：{len(item.logo_assets)}个"
+        return "默认"
+
+    def _logo_tooltip_text(self, item: ImageListItem) -> str:
+        if item.logo_rule != LOGO_RULE_CUSTOM or not item.logo_assets:
+            return self._logo_display_text(item)
+        names = "、".join(asset.name for asset in item.logo_assets)
+        return f"{self._logo_display_text(item)}\n{names}"
+
+    def _update_logo_cell(self, row: int) -> None:
+        if not self.supports_logo_overrides or row < 0 or row >= len(self.items):
+            return
+        table_item = self.table.item(row, LOGO_COLUMN)
+        if table_item is None:
+            table_item = QTableWidgetItem()
+            table_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, LOGO_COLUMN, table_item)
+        table_item.setText(self._logo_display_text(self.items[row]))
+        table_item.setToolTip(self._logo_tooltip_text(self.items[row]))
 
     def _remove_selected(self, *_args) -> None:
         rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()}, reverse=True)
@@ -1424,7 +1576,9 @@ class ImageOperationPage(QWidget):
         if len(self.items) == 1:
             source = self.items[0].path
             _, suffix = resolve_output_format(output_choice, source)
-            default_path = source.with_name(f"{source.stem}_已处理{suffix}")
+            apply_logo, logo_assets = self._effective_logo_for_item(self.items[0])
+            suffix_parts = [asset.name for asset in logo_assets] if apply_logo else None
+            default_path = source.with_name(f"{build_output_file_stem(source, suffix_parts)}{suffix}")
             selected, _ = QFileDialog.getSaveFileName(
                 self,
                 "选择保存位置",
@@ -1452,16 +1606,12 @@ class ImageOperationPage(QWidget):
         if settings is None:
             return
 
-        logos: list[Image.Image] = []
-        if settings.apply_logo:
-            try:
-                logos = load_logo_assets(settings.logo_assets)
-            except Exception:
-                self._show_message("error", "内置LOGO加载失败")
-                return
-
-        tasks = self._prepare_tasks(settings.output_choice)
+        tasks = self._prepare_tasks(settings)
         if not tasks:
+            return
+
+        logo_cache = self._load_task_logo_cache(tasks)
+        if logo_cache is None:
             return
 
         for row in range(self.table.rowCount()):
@@ -1479,8 +1629,7 @@ class ImageOperationPage(QWidget):
             tasks=tasks,
             output_size=settings.output_size,
             target_size=settings.target_size,
-            apply_logo=settings.apply_logo,
-            logos=logos,
+            logo_cache=logo_cache,
             watermark_options=settings.watermark_options,
         )
         self.worker.moveToThread(self.worker_thread)
@@ -1513,10 +1662,14 @@ class ImageOperationPage(QWidget):
             self._show_message("warning", "请输入正确的压缩大小")
             return None
 
-        logo_assets = self._get_selected_logo_assets()
-        if self._get_apply_logo() and not logo_assets:
+        logo_assets = self._get_selected_logo_assets(respect_apply_logo=False)
+        if self._default_logo_is_required() and not logo_assets:
             self._show_message("warning", "请选择LOGO")
             return None
+        for item in self.items:
+            if item.logo_rule == LOGO_RULE_CUSTOM and not item.logo_assets:
+                self._show_message("warning", "请选择LOGO")
+                return None
 
         watermark_options, watermark_error = self._get_watermark_options()
         if watermark_error:
@@ -1532,7 +1685,7 @@ class ImageOperationPage(QWidget):
             watermark_options=watermark_options,
         )
 
-    def _prepare_tasks(self, output_choice: str) -> list[ProcessingTask]:
+    def _prepare_tasks(self, settings: PageSettings) -> list[ProcessingTask]:
         if self.choose_save_radio.isChecked() and self.selected_save_path is None:
             if not self._choose_save_location():
                 self._show_message("warning", "请选择保存位置")
@@ -1543,20 +1696,47 @@ class ImageOperationPage(QWidget):
 
         if self.choose_save_radio.isChecked() and len(self.items) == 1:
             item = self.items[0]
-            output_format, suffix = resolve_output_format(output_choice, item.path)
+            output_format, suffix = resolve_output_format(settings.output_choice, item.path)
             selected = ensure_suffix(Path(self.selected_save_path), suffix)
             output_path = ensure_unique_path(selected, reserved)
-            tasks.append(ProcessingTask(0, item.path, output_path, output_format))
+            apply_logo, logo_assets = self._effective_logo_for_item(item, settings.apply_logo, settings.logo_assets)
+            tasks.append(
+                ProcessingTask(
+                    row=0,
+                    source_path=item.path,
+                    output_path=output_path,
+                    output_format=output_format,
+                    apply_logo=apply_logo,
+                    logo_assets=logo_assets,
+                )
+            )
             return tasks
 
         for row, item in enumerate(self.items):
-            output_format, _ = resolve_output_format(output_choice, item.path)
+            output_format, _ = resolve_output_format(settings.output_choice, item.path)
             if self.original_save_radio.isChecked():
                 output_dir = item.path.parent
             else:
                 output_dir = Path(self.selected_save_path)
-            output_path = build_default_output_path(item.path, output_dir, output_choice, reserved)
-            tasks.append(ProcessingTask(row, item.path, output_path, output_format))
+            apply_logo, logo_assets = self._effective_logo_for_item(item, settings.apply_logo, settings.logo_assets)
+            suffix_parts = [asset.name for asset in logo_assets] if apply_logo else None
+            output_path = build_default_output_path(
+                item.path,
+                output_dir,
+                settings.output_choice,
+                reserved,
+                suffix_parts,
+            )
+            tasks.append(
+                ProcessingTask(
+                    row=row,
+                    source_path=item.path,
+                    output_path=output_path,
+                    output_format=output_format,
+                    apply_logo=apply_logo,
+                    logo_assets=logo_assets,
+                )
+            )
 
         return tasks
 
@@ -1610,8 +1790,8 @@ class ImageOperationPage(QWidget):
             return self.logo_checkbox.isChecked()
         return False
 
-    def _get_selected_logo_assets(self) -> list[LogoAsset]:
-        if not self._get_apply_logo():
+    def _get_selected_logo_assets(self, respect_apply_logo: bool = True) -> list[LogoAsset]:
+        if respect_apply_logo and not self._get_apply_logo():
             return []
 
         if not hasattr(self, "logo_list"):
@@ -1629,6 +1809,59 @@ class ImageOperationPage(QWidget):
             selected.append(self.logo_assets[0])
 
         return selected
+
+    def _effective_logo_for_item(
+        self,
+        item: ImageListItem,
+        default_apply_logo: bool | None = None,
+        default_logo_assets: list[LogoAsset] | None = None,
+    ) -> tuple[bool, list[LogoAsset]]:
+        if not self.supports_logo_overrides:
+            return False, []
+
+        if item.logo_rule == LOGO_RULE_CUSTOM:
+            return True, list(item.logo_assets)
+        if item.logo_rule == LOGO_RULE_NONE:
+            return False, []
+
+        apply_logo = self._get_apply_logo() if default_apply_logo is None else default_apply_logo
+        if not apply_logo:
+            return False, []
+
+        logo_assets = (
+            self._get_selected_logo_assets(respect_apply_logo=False)
+            if default_logo_assets is None
+            else default_logo_assets
+        )
+        return True, list(logo_assets)
+
+    def _default_logo_is_required(self) -> bool:
+        if not self.supports_logo_overrides or not self._get_apply_logo():
+            return False
+        return any(item.logo_rule == LOGO_RULE_DEFAULT for item in self.items)
+
+    def _load_task_logo_cache(self, tasks: list[ProcessingTask]) -> dict[str, Image.Image] | None:
+        unique_assets: dict[str, LogoAsset] = {}
+        for task in tasks:
+            if not task.apply_logo:
+                continue
+            if not task.logo_assets:
+                self._show_message("warning", "请选择LOGO")
+                return None
+            for asset in task.logo_assets:
+                unique_assets.setdefault(str(asset.path), asset)
+
+        if not unique_assets:
+            return {}
+
+        assets = list(unique_assets.values())
+        try:
+            loaded_logos = load_logo_assets(assets)
+        except Exception:
+            self._show_message("error", "内置LOGO加载失败")
+            return None
+
+        return {str(asset.path): logo for asset, logo in zip(assets, loaded_logos)}
 
     def _get_apply_watermark(self) -> bool:
         if self.always_apply_watermark:
@@ -1762,6 +1995,7 @@ class ImageOperationPage(QWidget):
 
     def _set_processing_state(self, processing: bool) -> None:
         self.import_button.setEnabled(not processing)
+        self.import_folder_button.setEnabled(not processing)
         self.remove_button.setEnabled(not processing)
         self.clear_button.setEnabled(not processing)
         self.start_button.setEnabled(not processing)
@@ -1777,7 +2011,10 @@ class ImageOperationPage(QWidget):
         if self.has_optional_logo:
             self.logo_checkbox.setEnabled(not processing)
         if hasattr(self, "logo_list"):
-            self.logo_list.setEnabled(not processing and self._get_apply_logo())
+            self.logo_list.setEnabled(not processing)
+            self.logo_apply_selected_button.setEnabled(not processing)
+            self.logo_disable_selected_button.setEnabled(not processing)
+            self.logo_restore_default_button.setEnabled(not processing)
         if self.has_compression_controls:
             self.custom_size_edit.setEnabled(not processing and self.custom_size_radio.isChecked())
             for button in self.size_group.buttons():
@@ -1837,7 +2074,7 @@ class ImageOperationPage(QWidget):
         self.worker_thread = None
 
     def _set_row_status(self, row: int, status: str) -> None:
-        item = self.table.item(row, 4)
+        item = self.table.item(row, STATUS_COLUMN)
         if item is not None:
             item.setText(status)
 

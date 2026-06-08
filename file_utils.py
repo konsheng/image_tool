@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from pathlib import Path
 
 from config import SUPPORTED_EXTENSIONS
@@ -77,16 +78,25 @@ def ensure_unique_path(path: str | Path, reserved: set[str] | None = None) -> Pa
     return candidate
 
 
+def build_output_file_stem(source_path: str | Path, suffix_parts: Iterable[str] | None = None) -> str:
+    source = Path(source_path)
+    parts = [part.strip() for part in (suffix_parts or []) if part and part.strip()]
+    if parts:
+        return f"{source.stem}_{'_'.join(parts)}"
+    return f"{source.stem}_已处理"
+
+
 def build_default_output_path(
     source_path: str | Path,
     output_directory: str | Path,
     output_choice: str,
     reserved: set[str] | None = None,
+    suffix_parts: Iterable[str] | None = None,
 ) -> Path:
     source = Path(source_path)
     output_format, suffix = resolve_output_format(output_choice, source)
     del output_format
-    target = Path(output_directory) / f"{source.stem}_已处理{suffix}"
+    target = Path(output_directory) / f"{build_output_file_stem(source, suffix_parts)}{suffix}"
     return ensure_unique_path(target, reserved)
 
 

@@ -75,7 +75,7 @@ STATUS_FAILED = "失败"
 STATUS_EXCEEDED = "超出大小"
 STATUS_CANCELED = "已取消"
 
-TABLE_HEADERS = ["文件名", "格式", "尺寸", "大小", "状态"]
+TABLE_HEADERS = ["文件名", "格式", "尺寸", "大小", "LOGO", "状态"]
 
 
 def size_to_text(size: tuple[int, int]) -> str:
