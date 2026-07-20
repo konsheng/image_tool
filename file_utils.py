@@ -63,7 +63,8 @@ def ensure_suffix(path: Path, suffix: str) -> Path:
 
 
 def ensure_unique_path(path: str | Path, reserved: set[str] | None = None) -> Path:
-    reserved = reserved or set()
+    if reserved is None:
+        reserved = set()
     path = Path(path)
     candidate = path
     base_name = path.stem

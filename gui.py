@@ -6,8 +6,32 @@ from pathlib import Path
 from typing import Iterable
 
 from PIL import Image
-from PySide6.QtCore import QEasingCurve, QObject, QPoint, QRect, QSettings, QSize, Qt, QThread, QUrl, Signal, QVariantAnimation
-from PySide6.QtGui import QColor, QCursor, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon, QMouseEvent, QPalette, QPixmap
+from PySide6.QtCore import (
+    QEasingCurve,
+    QObject,
+    QPoint,
+    QRect,
+    QSettings,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    Signal,
+    QVariantAnimation,
+)
+from PySide6.QtGui import (
+    QColor,
+    QCloseEvent,
+    QCursor,
+    QDesktopServices,
+    QDragEnterEvent,
+    QDropEvent,
+    QIcon,
+    QMouseEvent,
+    QPalette,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -42,11 +66,15 @@ from qfluentwidgets import (
     ProgressBar,
     PushButton,
     RadioButton,
+    Slider,
     SmoothScrollArea,
+    SpinBox,
+    SwitchButton,
     TableWidget,
     Theme,
     TransparentToolButton,
     isDarkTheme,
+    qrouter,
     setTheme,
 )
 
@@ -54,7 +82,12 @@ from config import (
     APP_AUTHOR,
     APP_NAME,
     APP_VERSION,
+    COMPRESSION_MODE_LABELS,
+    COMPRESSION_MODE_QUALITY,
+    COMPRESSION_MODE_TARGET,
     CUSTOM_SIZE_LABEL,
+    DEFAULT_COMPRESSION_MODE,
+    DEFAULT_MANUAL_QUALITY,
     DEFAULT_WATERMARK_ANGLE,
     DEFAULT_WATERMARK_COLOR,
     DEFAULT_WATERMARK_FONT_SIZE,
@@ -72,7 +105,20 @@ from config import (
     DEFAULT_OUTPUT_FORMAT,
     DEFAULT_OUTPUT_SIZE,
     DEFAULT_TARGET_SIZE_LABEL,
+    FEATURE_COMPRESS,
+    FEATURE_COMPREHENSIVE,
+    FEATURE_DEFAULTS,
+    FEATURE_FORMAT,
+    FEATURE_LABELS,
+    FEATURE_LOGO,
+    FEATURE_RESIZE,
+    FEATURE_SETTINGS_PREFIX,
+    FEATURE_WATERMARK,
     KEEP_ORIGINAL_FORMAT,
+    MAX_MANUAL_QUALITY,
+    MAX_OUTPUT_DIMENSION,
+    MAX_OUTPUT_PIXELS,
+    MIN_MANUAL_QUALITY,
     OUTPUT_FORMATS,
     OUTPUT_SIZE_PRESETS,
     STATUS_CANCELED,
@@ -108,18 +154,32 @@ from image_processor import (
     create_watermark_layer,
     get_image_info,
     process_image,
+    render_encoded_preview_image,
     render_preview_image,
     watermark_position_for_layer,
 )
 from logo_manager import LogoAsset, list_logo_assets, load_logo_assets
 
 
-MODE_COMPREHENSIVE = "comprehensive"
-MODE_RESIZE = "resize"
-MODE_FORMAT = "format"
-MODE_COMPRESS = "compress"
-MODE_LOGO = "logo"
-MODE_WATERMARK = "watermark"
+MODE_COMPREHENSIVE = FEATURE_COMPREHENSIVE
+MODE_RESIZE = FEATURE_RESIZE
+MODE_FORMAT = FEATURE_FORMAT
+MODE_COMPRESS = FEATURE_COMPRESS
+MODE_LOGO = FEATURE_LOGO
+MODE_WATERMARK = FEATURE_WATERMARK
+
+COMPREHENSIVE_FEATURES = (
+    MODE_RESIZE,
+    MODE_FORMAT,
+    MODE_COMPRESS,
+    MODE_LOGO,
+    MODE_WATERMARK,
+)
+
+LOGO_ICON_SIZE = QSize(96, 64)
+LOGO_GRID_SIZE = QSize(132, 92)
+LOGO_ITEM_SIZE = QSize(LOGO_GRID_SIZE.width() - 8, 76)
+LOGO_MAX_VISIBLE_ROWS = 2
 
 LOGO_RULE_DEFAULT = "default"
 LOGO_RULE_NONE = "none"
@@ -254,6 +314,17 @@ def load_theme_value(settings: QSettings) -> str:
     return value if value in THEME_MAP else "light"
 
 
+def feature_setting_key(feature: str) -> str:
+    return f"{FEATURE_SETTINGS_PREFIX}/{feature}/enabled"
+
+
+def load_feature_states(settings: QSettings) -> dict[str, bool]:
+    return {
+        feature: settings.value(feature_setting_key(feature), default, type=bool)
+        for feature, default in FEATURE_DEFAULTS.items()
+    }
+
+
 class PreviewImageLabel(QLabel):
     drag_started = Signal(int, int)
     dragged = Signal(int, int)
@@ -326,6 +397,35 @@ class PreviewImageLabel(QLabel):
         return QRect(x, y, self._pixmap_size.width(), self._pixmap_size.height())
 
 
+class AdaptiveLogoListWidget(ListWidget):
+    """Keep the LOGO grid compact while exposing up to two full rows."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+    def sync_height(self) -> None:
+        grid_size = self.gridSize()
+        if grid_size.width() <= 0 or grid_size.height() <= 0:
+            return
+
+        available_width = max(grid_size.width(), self.viewport().width())
+        # QListView keeps a one-pixel trailing boundary before it places the
+        # next icon.  Matching that boundary avoids underestimating the row
+        # count when the viewport is an exact multiple of the grid width.
+        columns = max(1, (available_width - 1) // grid_size.width())
+        rows = max(1, (max(1, self.count()) + columns - 1) // columns)
+        visible_rows = min(rows, LOGO_MAX_VISIBLE_ROWS)
+        target_height = visible_rows * grid_size.height() + self.frameWidth() * 2
+        if self.height() != target_height:
+            self.setFixedHeight(target_height)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.sync_height()
+
+
 @dataclass
 class ImageListItem:
     path: Path
@@ -351,9 +451,78 @@ class PageSettings:
     output_size: tuple[int, int] | None
     output_choice: str
     target_size: int | None
+    quality: int | None
     apply_logo: bool
     logo_assets: list[LogoAsset]
     watermark_options: WatermarkOptions | None
+
+
+@dataclass(frozen=True)
+class PreviewRequest:
+    request_id: int
+    source_path: Path
+    file_name: str
+    source_size: int
+    options: ProcessOptions
+    logo_assets: list[LogoAsset]
+    compression_mode: str | None
+
+
+@dataclass(frozen=True)
+class PreviewOutcome:
+    image: Image.Image
+    compression: object | None
+    file_name: str
+    source_size: int
+    watermark_options: WatermarkOptions | None
+    compression_mode: str | None
+
+
+class PreviewWorker(QObject):
+    succeeded = Signal(int, object)
+    failed = Signal(int, str)
+    finished = Signal()
+
+    def __init__(self, request: PreviewRequest) -> None:
+        super().__init__()
+        self.request = request
+
+    def run(self) -> None:
+        request = self.request
+        try:
+            logos = load_logo_assets(request.logo_assets) if request.options.apply_logo else []
+            options = ProcessOptions(
+                output_format=request.options.output_format,
+                output_size=request.options.output_size,
+                target_size=request.options.target_size,
+                quality=request.options.quality,
+                apply_logo=request.options.apply_logo,
+                logos=logos,
+                watermark_options=request.options.watermark_options,
+            )
+            if request.compression_mode is None:
+                image = render_preview_image(request.source_path, options)
+                compression = None
+            else:
+                encoded = render_encoded_preview_image(request.source_path, options)
+                image = encoded.image
+                compression = encoded.compression
+
+            self.succeeded.emit(
+                request.request_id,
+                PreviewOutcome(
+                    image=image,
+                    compression=compression,
+                    file_name=request.file_name,
+                    source_size=request.source_size,
+                    watermark_options=request.options.watermark_options,
+                    compression_mode=request.compression_mode,
+                ),
+            )
+        except Exception as exc:
+            self.failed.emit(request.request_id, str(exc) or "图片无法打开")
+        finally:
+            self.finished.emit()
 
 
 class ProcessingWorker(QObject):
@@ -367,6 +536,7 @@ class ProcessingWorker(QObject):
         tasks: list[ProcessingTask],
         output_size: tuple[int, int] | None,
         target_size: int | None,
+        quality: int | None,
         logo_cache: dict[str, Image.Image],
         watermark_options: WatermarkOptions | None,
     ) -> None:
@@ -374,6 +544,7 @@ class ProcessingWorker(QObject):
         self.tasks = tasks
         self.output_size = output_size
         self.target_size = target_size
+        self.quality = quality
         self.logo_cache = logo_cache
         self.watermark_options = watermark_options
         self.cancel_requested = False
@@ -408,6 +579,7 @@ class ProcessingWorker(QObject):
                         output_format=task.output_format,
                         output_size=self.output_size,
                         target_size=self.target_size,
+                        quality=self.quality,
                         apply_logo=task.apply_logo,
                         logos=logo_copies,
                         watermark_options=self.watermark_options,
@@ -459,11 +631,24 @@ class ImageOperationPage(QWidget):
         self.last_output_location: Path | None = None
         self.worker_thread: QThread | None = None
         self.worker: ProcessingWorker | None = None
+        self.processing_active = False
+        self.preview_thread: QThread | None = None
+        self.preview_worker: PreviewWorker | None = None
+        self.pending_preview_request: PreviewRequest | None = None
+        self.active_preview_request: PreviewRequest | None = None
+        self.preview_request_serial = 0
+        self.preview_pending_ready = False
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.setInterval(300)
+        self.preview_timer.timeout.connect(self._start_pending_preview)
         self.size_lookup = {size_to_text(size): size for size in OUTPUT_SIZE_PRESETS}
         self.logo_assets: list[LogoAsset] = []
         self.watermark_image_path: Path | None = None
         self.watermark_drag_delta = (0, 0)
         self.current_preview_image_size: tuple[int, int] | None = None
+        self.feature_enabled = {feature: True for feature in COMPREHENSIVE_FEATURES}
+        self.feature_sections: dict[str, QWidget] = {}
 
         self.setAcceptDrops(True)
         self._setup_ui()
@@ -505,6 +690,45 @@ class ImageOperationPage(QWidget):
     @property
     def always_apply_watermark(self) -> bool:
         return self.mode == MODE_WATERMARK
+
+    def is_feature_enabled(self, feature: str) -> bool:
+        if self.mode != MODE_COMPREHENSIVE:
+            return True
+        return self.feature_enabled.get(feature, True)
+
+    def set_feature_enabled(self, feature: str, enabled: bool) -> None:
+        if self.mode != MODE_COMPREHENSIVE or feature not in self.feature_enabled:
+            return
+
+        self.feature_enabled[feature] = bool(enabled)
+        section = self.feature_sections.get(feature)
+        if section is not None:
+            section.setVisible(bool(enabled))
+
+        if feature == MODE_LOGO:
+            self.table.setColumnHidden(
+                LOGO_COLUMN,
+                not self.supports_logo_overrides or not bool(enabled),
+            )
+            self._update_logo_grid_state()
+
+        if feature in {MODE_RESIZE, MODE_FORMAT, MODE_COMPRESS}:
+            self.output_card.setVisible(
+                any(
+                    self.is_feature_enabled(output_feature)
+                    for output_feature in (MODE_RESIZE, MODE_FORMAT, MODE_COMPRESS)
+                )
+            )
+
+        if feature == MODE_FORMAT:
+            self._reset_save_location()
+        elif feature == MODE_RESIZE:
+            self._update_custom_size_state()
+        elif feature == MODE_COMPRESS:
+            self._update_custom_compression_state()
+        elif feature == MODE_WATERMARK:
+            self._update_watermark_controls_state()
+        self._refresh_preview()
 
     def _setup_ui(self) -> None:
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -630,16 +854,28 @@ class ImageOperationPage(QWidget):
         layout.addWidget(list_card)
 
         if self.has_optional_logo or self.always_apply_logo:
-            layout.addWidget(self._build_logo_card())
+            self.logo_card = self._build_logo_card()
+            layout.addWidget(self.logo_card)
+            if self.mode == MODE_COMPREHENSIVE:
+                self.feature_sections[MODE_LOGO] = self.logo_card
 
         if self.has_optional_watermark or self.always_apply_watermark:
-            layout.addWidget(self._build_watermark_card())
+            self.watermark_card = self._build_watermark_card()
+            layout.addWidget(self.watermark_card)
+            if self.mode == MODE_COMPREHENSIVE:
+                self.feature_sections[MODE_WATERMARK] = self.watermark_card
 
-        settings_row = QHBoxLayout()
-        settings_row.setSpacing(14)
-        settings_row.addWidget(self._build_output_card(), 2)
-        settings_row.addWidget(self._build_save_card(), 2)
-        layout.addLayout(settings_row)
+        self.output_card = self._build_output_card()
+        save_card = self._build_save_card()
+        if self.has_compression_controls:
+            layout.addWidget(self.output_card)
+            layout.addWidget(save_card)
+        else:
+            settings_row = QHBoxLayout()
+            settings_row.setSpacing(14)
+            settings_row.addWidget(self.output_card, 2)
+            settings_row.addWidget(save_card, 2)
+            layout.addLayout(settings_row)
 
         progress_card, progress_layout = self._create_card("处理进度")
         self.progress_text = QLabel("总数：0    当前：0/0    文件：-", self)
@@ -724,11 +960,29 @@ class ImageOperationPage(QWidget):
             """
         )
 
+    def _feature_section_layout(
+        self,
+        card: CardWidget,
+        layout: QVBoxLayout,
+        feature: str,
+    ) -> QVBoxLayout:
+        if self.mode != MODE_COMPREHENSIVE:
+            return layout
+
+        section = QWidget(card)
+        section_layout = QVBoxLayout(section)
+        section_layout.setContentsMargins(0, 0, 0, 0)
+        section_layout.setSpacing(10)
+        layout.addWidget(section)
+        self.feature_sections[feature] = section
+        return section_layout
+
     def _build_output_card(self) -> CardWidget:
-        title = "输出设置" if self.mode != MODE_COMPRESS else "压缩大小"
+        title = "输出设置" if self.mode != MODE_COMPRESS else "压缩设置"
         card, layout = self._create_card(title)
 
         if self.has_size_controls:
+            size_layout = self._feature_section_layout(card, layout, MODE_RESIZE)
             size_row = QHBoxLayout()
             size_row.addWidget(QLabel("输出尺寸", self))
             self.size_combo = ComboBox(self)
@@ -739,7 +993,7 @@ class ImageOperationPage(QWidget):
             self.size_combo.setFixedWidth(150)
             size_row.addWidget(self.size_combo)
             size_row.addStretch(1)
-            layout.addLayout(size_row)
+            size_layout.addLayout(size_row)
 
             custom_row = QHBoxLayout()
             self.custom_width_edit = LineEdit(self)
@@ -754,11 +1008,12 @@ class ImageOperationPage(QWidget):
             custom_row.addWidget(self.custom_height_edit)
             custom_row.addWidget(QLabel("px", self))
             custom_row.addStretch(1)
-            layout.addLayout(custom_row)
+            size_layout.addLayout(custom_row)
         else:
             self._add_readonly_row(layout, "输出尺寸", "保持原尺寸")
 
         if self.has_format_controls:
+            format_layout = self._feature_section_layout(card, layout, MODE_FORMAT)
             format_row = QHBoxLayout()
             format_row.addWidget(QLabel("输出格式", self))
             self.output_format_combo = ComboBox(self)
@@ -767,12 +1022,33 @@ class ImageOperationPage(QWidget):
             self.output_format_combo.setFixedWidth(150)
             format_row.addWidget(self.output_format_combo)
             format_row.addStretch(1)
-            layout.addLayout(format_row)
+            format_layout.addLayout(format_row)
         else:
             self._add_readonly_row(layout, "输出格式", KEEP_ORIGINAL_FORMAT)
 
         if self.has_compression_controls:
-            layout.addWidget(QLabel("压缩大小", self))
+            compression_layout = self._feature_section_layout(card, layout, MODE_COMPRESS)
+            mode_row = QHBoxLayout()
+            mode_row.addWidget(QLabel("压缩模式", self))
+            self.compression_mode_group = QButtonGroup(self)
+            self.target_mode_radio = RadioButton(self)
+            self.target_mode_radio.setText(COMPRESSION_MODE_LABELS[COMPRESSION_MODE_TARGET])
+            self.quality_mode_radio = RadioButton(self)
+            self.quality_mode_radio.setText(COMPRESSION_MODE_LABELS[COMPRESSION_MODE_QUALITY])
+            self.compression_mode_group.addButton(self.target_mode_radio)
+            self.compression_mode_group.addButton(self.quality_mode_radio)
+            mode_row.addWidget(self.target_mode_radio)
+            mode_row.addWidget(self.quality_mode_radio)
+            mode_row.addStretch(1)
+            compression_layout.addLayout(mode_row)
+
+            if DEFAULT_COMPRESSION_MODE == COMPRESSION_MODE_QUALITY:
+                self.quality_mode_radio.setChecked(True)
+            else:
+                self.target_mode_radio.setChecked(True)
+
+            self.target_size_label = QLabel("目标大小", self)
+            compression_layout.addWidget(self.target_size_label)
             self.size_group = QButtonGroup(self)
             self.size_radios: dict[str, RadioButton] = {}
             size_grid = QGridLayout()
@@ -799,7 +1075,32 @@ class ImageOperationPage(QWidget):
             size_grid.addLayout(custom_row, 1, 1)
 
             self.size_radios[DEFAULT_TARGET_SIZE_LABEL].setChecked(True)
-            layout.addLayout(size_grid)
+            compression_layout.addLayout(size_grid)
+
+            quality_row = QHBoxLayout()
+            self.quality_label = QLabel("压缩质量", self)
+            self.quality_slider = Slider(self)
+            self.quality_slider.setOrientation(Qt.Horizontal)
+            self.quality_slider.setRange(MIN_MANUAL_QUALITY, MAX_MANUAL_QUALITY)
+            self.quality_slider.setValue(DEFAULT_MANUAL_QUALITY)
+            self.quality_slider.setMinimumWidth(120)
+            self.quality_spinbox = SpinBox(self)
+            self.quality_spinbox.setRange(MIN_MANUAL_QUALITY, MAX_MANUAL_QUALITY)
+            self.quality_spinbox.setValue(DEFAULT_MANUAL_QUALITY)
+            self.quality_spinbox.setFixedWidth(160)
+            quality_row.addWidget(self.quality_label)
+            quality_row.addWidget(self.quality_slider, 1)
+            quality_row.addWidget(self.quality_spinbox)
+            quality_row.addStretch(1)
+            compression_layout.addLayout(quality_row)
+
+            self.compression_hint_label = QLabel(
+                "质量设置仅适用于 JPG/WEBP；PNG 将使用无损编码。",
+                self,
+            )
+            self.compression_hint_label.setObjectName("MutedLabel")
+            self.compression_hint_label.setWordWrap(True)
+            compression_layout.addWidget(self.compression_hint_label)
 
         return card
 
@@ -813,14 +1114,13 @@ class ImageOperationPage(QWidget):
         else:
             self._add_readonly_row(layout, "LOGO", "叠加LOGO")
 
-        self.logo_list = ListWidget(self)
+        self.logo_list = AdaptiveLogoListWidget(self)
         self.logo_list.setViewMode(QListView.IconMode)
         self.logo_list.setResizeMode(QListView.Adjust)
         self.logo_list.setMovement(QListView.Static)
         self.logo_list.setSelectionMode(QAbstractItemView.MultiSelection)
-        self.logo_list.setIconSize(QSize(132, 132))
-        self.logo_list.setGridSize(QSize(172, 182))
-        self.logo_list.setMinimumHeight(220)
+        self.logo_list.setIconSize(LOGO_ICON_SIZE)
+        self.logo_list.setGridSize(LOGO_GRID_SIZE)
         self.logo_list.setSpacing(8)
         self._load_logo_grid()
         layout.addWidget(self.logo_list)
@@ -1038,7 +1338,13 @@ class ImageOperationPage(QWidget):
             self.output_format_combo.currentTextChanged.connect(self._reset_save_location)
             self.output_format_combo.currentTextChanged.connect(self._refresh_preview)
         if self.has_compression_controls:
+            self.compression_mode_group.buttonClicked.connect(self._update_custom_compression_state)
+            self.compression_mode_group.buttonClicked.connect(self._refresh_preview)
             self.size_group.buttonClicked.connect(self._update_custom_compression_state)
+            self.size_group.buttonClicked.connect(self._refresh_preview)
+            self.custom_size_edit.textChanged.connect(self._refresh_preview)
+            self.quality_slider.valueChanged.connect(self._on_quality_slider_changed)
+            self.quality_spinbox.valueChanged.connect(self._on_quality_spinbox_changed)
         if self.has_optional_logo:
             self.logo_checkbox.stateChanged.connect(self._update_logo_grid_state)
             self.logo_checkbox.stateChanged.connect(self._refresh_preview)
@@ -1215,22 +1521,49 @@ class ImageOperationPage(QWidget):
         if not self.logo_assets:
             item = QListWidgetItem("无可用LOGO")
             item.setFlags(Qt.NoItemFlags)
+            item.setSizeHint(LOGO_ITEM_SIZE)
             self.logo_list.addItem(item)
+            QTimer.singleShot(0, self.logo_list.sync_height)
             return
 
         for index, asset in enumerate(self.logo_assets):
-            item = QListWidgetItem(QIcon(str(asset.path)), asset.name)
+            item = QListWidgetItem(self._logo_preview_icon(asset.path), asset.name)
             item.setData(Qt.UserRole, index)
             item.setToolTip(asset.path.name)
             item.setTextAlignment(Qt.AlignCenter)
+            item.setSizeHint(LOGO_ITEM_SIZE)
             self.logo_list.addItem(item)
 
         self.logo_list.item(0).setSelected(True)
         self.logo_list.setCurrentRow(0)
+        QTimer.singleShot(0, self.logo_list.sync_height)
+
+    def _logo_preview_icon(self, path: Path) -> QIcon:
+        """Build a compact preview without changing the source overlay asset."""
+        try:
+            with Image.open(path) as image:
+                preview = image.convert("RGBA")
+                alpha_bounds = preview.getchannel("A").getbbox()
+                if alpha_bounds is not None:
+                    preview = preview.crop(alpha_bounds)
+                preview.thumbnail(
+                    (LOGO_ICON_SIZE.width(), LOGO_ICON_SIZE.height()),
+                    Image.Resampling.LANCZOS,
+                )
+
+                buffer = BytesIO()
+                preview.save(buffer, format="PNG")
+                pixmap = QPixmap()
+                if pixmap.loadFromData(buffer.getvalue(), "PNG"):
+                    return QIcon(pixmap)
+        except Exception:
+            pass
+
+        return QIcon(str(path))
 
     def _update_logo_grid_state(self, *_args) -> None:
         if hasattr(self, "logo_list"):
-            self.logo_list.setEnabled(self.worker is None)
+            self.logo_list.setEnabled(not self.processing_active)
         self._refresh_preview()
 
     def _selected_table_rows(self) -> list[int]:
@@ -1307,7 +1640,7 @@ class ImageOperationPage(QWidget):
         if not (self.has_optional_watermark or self.always_apply_watermark):
             return
 
-        processing = self.worker is not None
+        processing = self.processing_active
         apply_watermark = self._get_apply_watermark()
         enabled = apply_watermark and not processing
         is_text = self.watermark_type_combo.currentText() == WATERMARK_TYPE_TEXT
@@ -1338,6 +1671,13 @@ class ImageOperationPage(QWidget):
         if not hasattr(self, "preview_image_label"):
             return
 
+        self.preview_request_serial += 1
+        request_id = self.preview_request_serial
+        self.preview_timer.stop()
+        self.pending_preview_request = None
+        self.preview_pending_ready = False
+        self._update_compression_format_hint()
+
         rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
         if not rows:
             self._set_preview_message("请选择图片")
@@ -1349,9 +1689,27 @@ class ImageOperationPage(QWidget):
             return
 
         output_size = self._get_output_size()
-        if self.has_size_controls and output_size is None:
+        if (
+            self.has_size_controls
+            and self.is_feature_enabled(MODE_RESIZE)
+            and output_size is None
+        ):
             self._set_preview_message("请输入正确的输出尺寸")
             return
+
+        compression_mode = self._get_compression_mode()
+        target_size: int | None = None
+        quality: int | None = None
+        if compression_mode == COMPRESSION_MODE_TARGET:
+            target_size = self._get_target_size()
+            if target_size is None:
+                self._set_preview_message("请输入正确的压缩大小")
+                return
+        elif compression_mode == COMPRESSION_MODE_QUALITY:
+            quality = self._get_manual_quality()
+            if quality is None:
+                self._set_preview_message("请输入正确的压缩质量")
+                return
 
         apply_logo, logo_assets = self._effective_logo_for_item(self.items[row])
         if apply_logo and not logo_assets:
@@ -1364,32 +1722,102 @@ class ImageOperationPage(QWidget):
             return
 
         try:
-            logos = load_logo_assets(logo_assets) if apply_logo else []
-            preview = render_preview_image(
-                self.items[row].path,
-                ProcessOptions(
-                    output_format=self._get_output_choice(),
+            item = self.items[row]
+            output_format, _ = resolve_output_format(self._get_output_choice(), item.path)
+            source_size = item.path.stat().st_size
+            request = PreviewRequest(
+                request_id=request_id,
+                source_path=item.path,
+                file_name=item.path.name,
+                source_size=source_size,
+                options=ProcessOptions(
+                    output_format=output_format,
                     output_size=output_size,
-                    target_size=None,
+                    target_size=target_size,
+                    quality=quality,
                     apply_logo=apply_logo,
-                    logos=logos,
+                    logos=[],
                     watermark_options=watermark_options,
                 ),
+                logo_assets=list(logo_assets),
+                compression_mode=compression_mode,
             )
-            self._set_preview_image(preview, self.items[row].path.name, watermark_options)
         except Exception as exc:
-            reason = str(exc) or "图片无法打开"
-            if "内置LOGO" in reason:
-                reason = "内置LOGO加载失败"
-            elif "水印图片加载失败" in reason:
-                reason = "水印图片加载失败"
-            elif "请选择水印图片" in reason:
-                reason = "请选择水印图片"
-            elif "请输入水印文字" in reason:
-                reason = "请输入水印文字"
-            elif "图片无法打开" not in reason:
-                reason = "图片无法打开"
-            self._set_preview_message(reason)
+            self._set_preview_message(self._preview_error_message(str(exc)))
+            return
+
+        self.pending_preview_request = request
+        self.preview_info_label.setText("正在生成预览…")
+        self.preview_timer.start()
+
+    def _start_pending_preview(self) -> None:
+        self.preview_pending_ready = True
+        if self.preview_thread is not None:
+            return
+
+        request = self.pending_preview_request
+        if request is None or request.request_id != self.preview_request_serial:
+            self.preview_pending_ready = False
+            return
+
+        self.pending_preview_request = None
+        self.preview_pending_ready = False
+        self.active_preview_request = request
+        thread = QThread(self)
+        worker = PreviewWorker(request)
+        self.preview_thread = thread
+        self.preview_worker = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_preview_succeeded)
+        worker.failed.connect(self._on_preview_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_preview_thread_finished)
+        thread.start()
+
+    def _on_preview_succeeded(self, request_id: int, outcome: object) -> None:
+        if request_id != self.preview_request_serial or not isinstance(outcome, PreviewOutcome):
+            return
+        self._set_preview_image(
+            outcome.image,
+            outcome.file_name,
+            outcome.watermark_options,
+            outcome.compression,
+            outcome.source_size,
+            outcome.compression_mode,
+        )
+
+    def _on_preview_failed(self, request_id: int, reason: str) -> None:
+        if request_id != self.preview_request_serial:
+            return
+        self._set_preview_message(self._preview_error_message(reason))
+
+    def _on_preview_thread_finished(self) -> None:
+        self.preview_worker = None
+        self.preview_thread = None
+        self.active_preview_request = None
+        if self.pending_preview_request is None:
+            return
+        if self.preview_pending_ready:
+            self._start_pending_preview()
+        elif not self.preview_timer.isActive():
+            self.preview_timer.start()
+
+    def _preview_error_message(self, reason: str) -> str:
+        reason = reason or "图片无法打开"
+        if "内置LOGO" in reason:
+            return "内置LOGO加载失败"
+        if "水印图片加载失败" in reason:
+            return "水印图片加载失败"
+        if "请选择水印图片" in reason:
+            return "请选择水印图片"
+        if "请输入水印文字" in reason:
+            return "请输入水印文字"
+        if "图片无法打开" in reason:
+            return "图片无法打开"
+        return "预览生成失败"
 
     def _set_preview_message(self, message: str) -> None:
         self.preview_image_label.clear()
@@ -1403,6 +1831,9 @@ class ImageOperationPage(QWidget):
         image: Image.Image,
         file_name: str,
         watermark_options: WatermarkOptions | None,
+        compression: object | None = None,
+        source_size: int | None = None,
+        compression_mode: str | None = None,
     ) -> None:
         preview = image.copy()
         max_width = max(220, self.preview_image_label.width() - 24)
@@ -1416,9 +1847,39 @@ class ImageOperationPage(QWidget):
 
         self.preview_image_label.setText("")
         self.preview_image_label.set_preview_pixmap(pixmap, image.size)
-        self.preview_image_label.set_drag_enabled(watermark_options is not None and self.worker is None)
+        self.preview_image_label.set_drag_enabled(watermark_options is not None and not self.processing_active)
         self.current_preview_image_size = image.size
-        self.preview_info_label.setText(f"{file_name}    {image.width}×{image.height}")
+        lines = [f"{file_name}    {image.width}×{image.height}"]
+        if compression is not None:
+            output_size = getattr(compression, "size", None)
+            lines.append(
+                f"原始大小：{bytes_to_display(source_size)}    "
+                f"预计输出：{bytes_to_display(output_size)}"
+            )
+            if source_size and isinstance(output_size, int):
+                size_delta = (output_size / source_size - 1) * 100
+                if size_delta > 0:
+                    detail_parts = [f"增大比例：{size_delta:.1f}%"]
+                else:
+                    detail_parts = [f"缩减比例：{-size_delta:.1f}%"]
+            else:
+                detail_parts = ["缩减比例：-"]
+
+            actual_quality = getattr(compression, "quality", None)
+            if isinstance(actual_quality, int):
+                quality_label = "自动质量" if compression_mode == COMPRESSION_MODE_TARGET else "实际质量"
+                detail_parts.append(f"{quality_label}：{actual_quality}")
+            else:
+                detail = str(getattr(compression, "detail", ""))
+                if detail.startswith("palette="):
+                    detail_parts.append(f"编码：PNG 减色（{detail.removeprefix('palette=')} 色）")
+                else:
+                    detail_parts.append("编码：PNG 无损")
+
+            if bool(getattr(compression, "exceeded", False)):
+                detail_parts.append("超出目标大小")
+            lines.append("    ".join(detail_parts))
+        self.preview_info_label.setText("\n".join(lines))
 
     def _on_preview_watermark_drag_started(self, x: int, y: int) -> None:
         options, error = self._get_watermark_options()
@@ -1536,7 +1997,11 @@ class ImageOperationPage(QWidget):
     def _update_custom_size_state(self, *_args) -> None:
         if not self.has_size_controls:
             return
-        enabled = self.size_combo.currentText() == CUSTOM_SIZE_LABEL
+        enabled = (
+            self.size_combo.currentText() == CUSTOM_SIZE_LABEL
+            and self.is_feature_enabled(MODE_RESIZE)
+            and not self.processing_active
+        )
         self.custom_width_edit.setEnabled(enabled)
         self.custom_height_edit.setEnabled(enabled)
         if enabled:
@@ -1545,13 +2010,66 @@ class ImageOperationPage(QWidget):
     def _update_custom_compression_state(self, *_args) -> None:
         if not self.has_compression_controls:
             return
-        self.custom_size_edit.setEnabled(self.custom_size_radio.isChecked())
-        if self.custom_size_radio.isChecked():
+
+        processing = self.processing_active
+        target_mode = self.target_mode_radio.isChecked()
+        target_enabled = target_mode and not processing
+        quality_enabled = (not target_mode) and not processing
+
+        for button in self.compression_mode_group.buttons():
+            button.setEnabled(not processing)
+        self.target_size_label.setEnabled(target_enabled)
+        for button in self.size_group.buttons():
+            button.setEnabled(target_enabled)
+        self.custom_size_edit.setEnabled(target_enabled and self.custom_size_radio.isChecked())
+        self.quality_label.setEnabled(quality_enabled)
+        self.quality_slider.setEnabled(quality_enabled)
+        self.quality_spinbox.setEnabled(quality_enabled)
+        self._update_compression_format_hint()
+
+        if target_enabled and self.custom_size_radio.isChecked():
             self.custom_size_edit.setFocus()
+
+    def _on_quality_slider_changed(self, value: int) -> None:
+        if self.quality_spinbox.value() != value:
+            self.quality_spinbox.setValue(value)
+            return
+        self._refresh_preview()
+
+    def _on_quality_spinbox_changed(self, value: int) -> None:
+        if self.quality_slider.value() != value:
+            self.quality_slider.setValue(value)
+            return
+        self._refresh_preview()
+
+    def _update_compression_format_hint(self) -> None:
+        if not self.has_compression_controls:
+            return
+
+        output_format: str | None = None
+        rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if rows and 0 <= rows[0].row() < len(self.items):
+            output_format, _ = resolve_output_format(
+                self._get_output_choice(),
+                self.items[rows[0].row()].path,
+            )
+        elif self.has_format_controls:
+            output_format, _ = resolve_output_format(self._get_output_choice(), Path("preview.jpg"))
+
+        compression_mode = self._get_compression_mode()
+        if compression_mode == COMPRESSION_MODE_TARGET and output_format == "PNG":
+            text = "当前输出为 PNG：先无损压缩，超出目标时会尝试减少颜色。"
+        elif compression_mode == COMPRESSION_MODE_TARGET:
+            text = "按目标大小会优先搜索较高的 JPG/WEBP 质量。"
+        elif output_format == "PNG":
+            text = "当前输出为 PNG：质量设置不生效，将使用无损编码。"
+        else:
+            text = "质量设置仅适用于 JPG/WEBP；PNG 将使用无损编码。"
+        self.compression_hint_label.setText(text)
 
     def _update_save_mode(self, *_args) -> None:
         choose_mode = self.choose_save_radio.isChecked()
-        self.choose_save_button.setEnabled(choose_mode)
+        self.choose_save_button.setEnabled(choose_mode and not self.processing_active)
         if self.original_save_radio.isChecked():
             self.selected_save_path = None
             self.save_path_label.setText("原图位置")
@@ -1629,6 +2147,7 @@ class ImageOperationPage(QWidget):
             tasks=tasks,
             output_size=settings.output_size,
             target_size=settings.target_size,
+            quality=settings.quality,
             logo_cache=logo_cache,
             watermark_options=settings.watermark_options,
         )
@@ -1653,23 +2172,33 @@ class ImageOperationPage(QWidget):
 
     def _get_page_settings(self) -> PageSettings | None:
         output_size = self._get_output_size()
-        if self.has_size_controls and output_size is None:
+        if (
+            self.has_size_controls
+            and self.is_feature_enabled(MODE_RESIZE)
+            and output_size is None
+        ):
             self._show_message("warning", "请输入正确的输出尺寸")
             return None
 
+        compression_mode = self._get_compression_mode()
         target_size = self._get_target_size()
-        if self.has_compression_controls and target_size is None:
+        quality = self._get_manual_quality()
+        if compression_mode == COMPRESSION_MODE_TARGET and target_size is None:
             self._show_message("warning", "请输入正确的压缩大小")
+            return None
+        if compression_mode == COMPRESSION_MODE_QUALITY and quality is None:
+            self._show_message("warning", "请输入正确的压缩质量")
             return None
 
         logo_assets = self._get_selected_logo_assets(respect_apply_logo=False)
         if self._default_logo_is_required() and not logo_assets:
             self._show_message("warning", "请选择LOGO")
             return None
-        for item in self.items:
-            if item.logo_rule == LOGO_RULE_CUSTOM and not item.logo_assets:
-                self._show_message("warning", "请选择LOGO")
-                return None
+        if self.is_feature_enabled(MODE_LOGO):
+            for item in self.items:
+                if item.logo_rule == LOGO_RULE_CUSTOM and not item.logo_assets:
+                    self._show_message("warning", "请选择LOGO")
+                    return None
 
         watermark_options, watermark_error = self._get_watermark_options()
         if watermark_error:
@@ -1680,6 +2209,7 @@ class ImageOperationPage(QWidget):
             output_size=output_size,
             output_choice=self._get_output_choice(),
             target_size=target_size,
+            quality=quality,
             apply_logo=self._get_apply_logo(),
             logo_assets=logo_assets,
             watermark_options=watermark_options,
@@ -1741,12 +2271,12 @@ class ImageOperationPage(QWidget):
         return tasks
 
     def _get_output_choice(self) -> str:
-        if self.has_format_controls:
+        if self.has_format_controls and self.is_feature_enabled(MODE_FORMAT):
             return self.output_format_combo.currentText()
         return KEEP_ORIGINAL_FORMAT
 
     def _get_output_size(self) -> tuple[int, int] | None:
-        if not self.has_size_controls:
+        if not self.has_size_controls or not self.is_feature_enabled(MODE_RESIZE):
             return None
 
         current = self.size_combo.currentText()
@@ -1761,10 +2291,18 @@ class ImageOperationPage(QWidget):
 
         if width <= 0 or height <= 0:
             return None
+        if width > MAX_OUTPUT_DIMENSION or height > MAX_OUTPUT_DIMENSION:
+            return None
+        if width * height > MAX_OUTPUT_PIXELS:
+            return None
         return width, height
 
     def _get_target_size(self) -> int | None:
-        if not self.has_compression_controls:
+        if (
+            not self.has_compression_controls
+            or not self.is_feature_enabled(MODE_COMPRESS)
+            or self._get_compression_mode() != COMPRESSION_MODE_TARGET
+        ):
             return None
 
         for label, bytes_value in TARGET_SIZE_OPTIONS.items():
@@ -1775,15 +2313,40 @@ class ImageOperationPage(QWidget):
             text = self.custom_size_edit.text().strip()
             try:
                 value = float(text)
-            except ValueError:
+                size_bytes = int(value * 1_000_000)
+            except (ValueError, OverflowError):
                 return None
-            if value <= 0:
+            if value <= 0 or size_bytes <= 0:
                 return None
-            return int(value * 1_000_000)
+            return size_bytes
 
         return None
 
+    def _get_compression_mode(self) -> str | None:
+        if (
+            not self.has_compression_controls
+            or not self.is_feature_enabled(MODE_COMPRESS)
+        ):
+            return None
+        if self.quality_mode_radio.isChecked():
+            return COMPRESSION_MODE_QUALITY
+        return COMPRESSION_MODE_TARGET
+
+    def _get_manual_quality(self) -> int | None:
+        if (
+            not self.has_compression_controls
+            or not self.is_feature_enabled(MODE_COMPRESS)
+            or self._get_compression_mode() != COMPRESSION_MODE_QUALITY
+        ):
+            return None
+        value = self.quality_spinbox.value()
+        if value < MIN_MANUAL_QUALITY or value > MAX_MANUAL_QUALITY:
+            return None
+        return value
+
     def _get_apply_logo(self) -> bool:
+        if not self.is_feature_enabled(MODE_LOGO):
+            return False
         if self.always_apply_logo:
             return True
         if self.has_optional_logo:
@@ -1816,7 +2379,7 @@ class ImageOperationPage(QWidget):
         default_apply_logo: bool | None = None,
         default_logo_assets: list[LogoAsset] | None = None,
     ) -> tuple[bool, list[LogoAsset]]:
-        if not self.supports_logo_overrides:
+        if not self.supports_logo_overrides or not self.is_feature_enabled(MODE_LOGO):
             return False, []
 
         if item.logo_rule == LOGO_RULE_CUSTOM:
@@ -1864,6 +2427,8 @@ class ImageOperationPage(QWidget):
         return {str(asset.path): logo for asset, logo in zip(assets, loaded_logos)}
 
     def _get_apply_watermark(self) -> bool:
+        if not self.is_feature_enabled(MODE_WATERMARK):
+            return False
         if self.always_apply_watermark:
             return True
         if self.has_optional_watermark:
@@ -1994,6 +2559,7 @@ class ImageOperationPage(QWidget):
         edit.blockSignals(previous)
 
     def _set_processing_state(self, processing: bool) -> None:
+        self.processing_active = processing
         self.import_button.setEnabled(not processing)
         self.import_folder_button.setEnabled(not processing)
         self.remove_button.setEnabled(not processing)
@@ -2016,14 +2582,14 @@ class ImageOperationPage(QWidget):
             self.logo_disable_selected_button.setEnabled(not processing)
             self.logo_restore_default_button.setEnabled(not processing)
         if self.has_compression_controls:
-            self.custom_size_edit.setEnabled(not processing and self.custom_size_radio.isChecked())
-            for button in self.size_group.buttons():
-                button.setEnabled(not processing)
+            self._update_custom_compression_state()
         if self.has_optional_watermark or self.always_apply_watermark:
             self._update_watermark_controls_state()
         for button in self.save_group.buttons():
             button.setEnabled(not processing)
         self.choose_save_button.setEnabled(not processing and self.choose_save_radio.isChecked())
+        if processing:
+            self.preview_image_label.set_drag_enabled(False)
 
     def _on_item_started(self, row: int, file_name: str) -> None:
         del file_name
@@ -2055,7 +2621,6 @@ class ImageOperationPage(QWidget):
         last_output_dir: object,
         canceled: bool,
     ) -> None:
-        self._set_processing_state(False)
         self._update_result_labels(total, success, failure, warning)
         if not canceled:
             self.progress_bar.setValue(100 if total else 0)
@@ -2070,6 +2635,33 @@ class ImageOperationPage(QWidget):
             self._show_message("success", "图片处理完成")
 
     def _clear_worker_refs(self) -> None:
+        self.worker = None
+        self.worker_thread = None
+        if self.processing_active:
+            self._set_processing_state(False)
+            self._refresh_preview()
+
+    def shutdown(self) -> None:
+        """Wait for page-owned workers before Qt destroys their threads."""
+        self.preview_request_serial += 1
+        self.preview_timer.stop()
+        self.pending_preview_request = None
+        self.preview_pending_ready = False
+
+        preview_thread = self.preview_thread
+        if preview_thread is not None and preview_thread.isRunning():
+            preview_thread.quit()
+            preview_thread.wait()
+        self.preview_worker = None
+        self.preview_thread = None
+        self.active_preview_request = None
+
+        if self.worker is not None:
+            self.worker.request_cancel()
+        processing_thread = self.worker_thread
+        if processing_thread is not None and processing_thread.isRunning():
+            processing_thread.quit()
+            processing_thread.wait()
         self.worker = None
         self.worker_thread = None
 
@@ -2108,11 +2700,19 @@ class ImageOperationPage(QWidget):
 
 
 class SettingsPage(QWidget):
-    def __init__(self, current_theme: str, on_theme_changed) -> None:
+    def __init__(
+        self,
+        current_theme: str,
+        on_theme_changed,
+        feature_states: dict[str, bool],
+        on_feature_changed,
+    ) -> None:
         super().__init__()
         self.setObjectName("settingsPage")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.on_theme_changed = on_theme_changed
+        self.on_feature_changed = on_feature_changed
+        self.feature_switches: dict[str, SwitchButton] = {}
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(28, 24, 28, 28)
@@ -2144,9 +2744,47 @@ class SettingsPage(QWidget):
         card_layout.addLayout(theme_row)
 
         root_layout.addWidget(card)
+
+        feature_card = CardWidget(self)
+        feature_card.setObjectName("PanelCard")
+        feature_layout = QVBoxLayout(feature_card)
+        feature_layout.setContentsMargins(18, 16, 18, 16)
+        feature_layout.setSpacing(12)
+
+        feature_title = QLabel("功能开关", self)
+        feature_title.setObjectName("SectionTitle")
+        feature_layout.addWidget(feature_title)
+
+        feature_hint = QLabel(
+            "关闭后会隐藏对应入口；尺寸、格式、压缩、LOGO和水印也会从综合处理中停用。",
+            self,
+        )
+        feature_hint.setObjectName("MutedLabel")
+        feature_hint.setWordWrap(True)
+        feature_layout.addWidget(feature_hint)
+
+        for feature, label in FEATURE_LABELS.items():
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            display_label = f"{label}（默认关闭）" if feature == MODE_WATERMARK else label
+            row.addWidget(QLabel(display_label, self))
+            row.addStretch(1)
+            switch = SwitchButton(feature_card)
+            switch.setOnText("开启")
+            switch.setOffText("关闭")
+            switch.setChecked(feature_states.get(feature, FEATURE_DEFAULTS[feature]))
+            row.addWidget(switch)
+            feature_layout.addLayout(row)
+            self.feature_switches[feature] = switch
+
+        root_layout.addWidget(feature_card)
         root_layout.addStretch(1)
 
         self.theme_combo.currentTextChanged.connect(self._theme_changed)
+        for feature, switch in self.feature_switches.items():
+            switch.checkedChanged.connect(
+                lambda checked, feature=feature: self.on_feature_changed(feature, checked)
+            )
         self.apply_theme_styles()
 
     def apply_theme_styles(self) -> None:
@@ -2217,9 +2855,10 @@ class AboutPage(QWidget):
 
 
 class ImageToolWindow(FluentWindow):
-    def __init__(self) -> None:
-        settings = QSettings("ImageTool", APP_NAME)
+    def __init__(self, settings: QSettings | None = None) -> None:
+        settings = settings or QSettings("ImageTool", APP_NAME)
         theme_value = load_theme_value(settings)
+        feature_states = load_feature_states(settings)
         setTheme(THEME_MAP[theme_value])
 
         super().__init__()
@@ -2238,6 +2877,7 @@ class ImageToolWindow(FluentWindow):
             self.navigationInterface.panel.setAttribute(Qt.WA_StyledBackground, True)
         self.settings = settings
         self.theme_value = theme_value
+        self.feature_states = feature_states
         self.preview_collapsed = False
 
         self.setWindowTitle(APP_NAME)
@@ -2250,8 +2890,21 @@ class ImageToolWindow(FluentWindow):
         self.compress_page = ImageOperationPage("图片压缩", MODE_COMPRESS, "compressPage")
         self.logo_page = ImageOperationPage("LOGO叠加", MODE_LOGO, "logoPage")
         self.watermark_page = ImageOperationPage("水印", MODE_WATERMARK, "watermarkPage")
-        self.settings_page = SettingsPage(self.theme_value, self._set_theme_mode)
+        self.settings_page = SettingsPage(
+            self.theme_value,
+            self._set_theme_mode,
+            self.feature_states,
+            self._set_feature_enabled,
+        )
         self.about_page = AboutPage()
+        self.feature_pages = {
+            MODE_COMPREHENSIVE: self.comprehensive_page,
+            MODE_RESIZE: self.resize_page,
+            MODE_FORMAT: self.format_page,
+            MODE_COMPRESS: self.compress_page,
+            MODE_LOGO: self.logo_page,
+            MODE_WATERMARK: self.watermark_page,
+        }
         self.operation_pages = [
             self.comprehensive_page,
             self.resize_page,
@@ -2269,12 +2922,21 @@ class ImageToolWindow(FluentWindow):
         for page in self.operation_pages:
             page.preview_collapse_requested.connect(self._set_preview_sidebar_collapsed)
 
-        self.addSubInterface(self.comprehensive_page, FIF.HOME, "综合处理")
-        self.addSubInterface(self.resize_page, FIF.FIT_PAGE, "尺寸处理")
-        self.addSubInterface(self.format_page, FIF.IMAGE_EXPORT, "格式转换")
-        self.addSubInterface(self.compress_page, FIF.ZIP_FOLDER, "图片压缩")
-        self.addSubInterface(self.logo_page, FIF.EDIT, "LOGO叠加")
-        self.addSubInterface(self.watermark_page, FIF.TAG, "水印")
+        feature_navigation = (
+            (MODE_COMPREHENSIVE, self.comprehensive_page, FIF.HOME),
+            (MODE_RESIZE, self.resize_page, FIF.FIT_PAGE),
+            (MODE_FORMAT, self.format_page, FIF.IMAGE_EXPORT),
+            (MODE_COMPRESS, self.compress_page, FIF.ZIP_FOLDER),
+            (MODE_LOGO, self.logo_page, FIF.EDIT),
+            (MODE_WATERMARK, self.watermark_page, FIF.TAG),
+        )
+        self.feature_nav_items = {}
+        for feature, page, icon in feature_navigation:
+            self.feature_nav_items[feature] = self.addSubInterface(
+                page,
+                icon,
+                FEATURE_LABELS[feature],
+            )
         self.addSubInterface(
             self.settings_page,
             FIF.SETTING,
@@ -2294,7 +2956,14 @@ class ImageToolWindow(FluentWindow):
         self.navigationInterface.setExpandWidth(190)
         self.navigationInterface.setMinimumExpandWidth(160)
         self.navigationInterface.expand(useAni=False)
-        self.switchTo(self.comprehensive_page)
+        for feature, enabled in self.feature_states.items():
+            self._set_feature_enabled(
+                feature,
+                enabled,
+                persist=False,
+                ensure_current=False,
+            )
+        self.switchTo(self._first_enabled_page())
         self._apply_theme_styles()
 
     def center_on_screen(self) -> None:
@@ -2306,6 +2975,76 @@ class ImageToolWindow(FluentWindow):
         frame_geometry = self.frameGeometry()
         frame_geometry.moveCenter(available_geometry.center())
         self.move(frame_geometry.topLeft())
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        for page in self.operation_pages:
+            page.shutdown()
+        qrouter.history = [
+            item for item in qrouter.history if item.stacked is not self.stackedWidget
+        ]
+        qrouter.stackHistories.pop(self.stackedWidget, None)
+        qrouter.emptyChanged.emit(not bool(qrouter.history))
+        super().closeEvent(event)
+
+    def _first_enabled_page(self) -> QWidget:
+        for feature in FEATURE_DEFAULTS:
+            if self.feature_states.get(feature, FEATURE_DEFAULTS[feature]):
+                return self.feature_pages[feature]
+        return self.settings_page
+
+    def _set_feature_enabled(
+        self,
+        feature: str,
+        enabled: bool,
+        *,
+        persist: bool = True,
+        ensure_current: bool = True,
+    ) -> None:
+        if feature not in self.feature_pages:
+            return
+
+        enabled = bool(enabled)
+        self.feature_states[feature] = enabled
+
+        page = self.feature_pages[feature]
+        if not enabled:
+            fallback_page = self._first_enabled_page()
+            stack_history = qrouter.stackHistories.get(self.stackedWidget)
+            if stack_history is not None and stack_history.defaultRouteKey == page.objectName():
+                qrouter.setDefaultRouteKey(
+                    self.stackedWidget,
+                    fallback_page.objectName(),
+                )
+
+            if ensure_current and self.stackedWidget.currentWidget() is page:
+                self.switchTo(fallback_page)
+
+            # Navigation items can be hidden while their route remains in the
+            # FluentWindow back stack.  Remove it so the return button cannot
+            # reopen a feature that the user has switched off.
+            if stack_history is not None:
+                stack_history.remove(page.objectName())
+            qrouter.history = [
+                item
+                for item in qrouter.history
+                if not (
+                    item.stacked is self.stackedWidget
+                    and item.routeKey == page.objectName()
+                )
+            ]
+            qrouter.emptyChanged.emit(not bool(qrouter.history))
+
+        page.setEnabled(enabled)
+
+        nav_item = self.feature_nav_items.get(feature)
+        if nav_item is not None:
+            nav_item.setVisible(enabled)
+
+        if feature in COMPREHENSIVE_FEATURES:
+            self.comprehensive_page.set_feature_enabled(feature, enabled)
+
+        if persist:
+            self.settings.setValue(feature_setting_key(feature), enabled)
 
     def _set_theme_mode(self, value: str) -> None:
         if value not in THEME_MAP:

@@ -1,0 +1,352 @@
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtCore import QSettings, QSize
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QListView, QListWidgetItem
+from qfluentwidgets import qrouter
+
+from config import (
+    CUSTOM_SIZE_LABEL,
+    FEATURE_DEFAULTS,
+    MAX_OUTPUT_DIMENSION,
+    MAX_OUTPUT_PIXELS,
+)
+from gui import (
+    AdaptiveLogoListWidget,
+    ImageOperationPage,
+    ImageToolWindow,
+    MODE_COMPRESS,
+    MODE_COMPREHENSIVE,
+    MODE_FORMAT,
+    MODE_LOGO,
+    MODE_RESIZE,
+    MODE_WATERMARK,
+)
+
+
+class GuiFeatureTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def process_events(self, cycles: int = 6) -> None:
+        for _ in range(cycles):
+            self.app.processEvents()
+
+    def make_window(self, settings_path: Path) -> tuple[ImageToolWindow, QSettings]:
+        settings = QSettings(str(settings_path), QSettings.IniFormat)
+        window = ImageToolWindow(settings=settings)
+        window.resize(1220, 820)
+        window.show()
+        self.process_events()
+        return window, settings
+
+    def close_window(self, window: ImageToolWindow) -> None:
+        window.close()
+        window.deleteLater()
+        self.process_events()
+
+    def test_feature_defaults_and_global_watermark_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window, _ = self.make_window(Path(temp_dir) / "settings.ini")
+            try:
+                self.assertEqual(window.feature_states, FEATURE_DEFAULTS)
+                for page in (window.comprehensive_page, window.compress_page):
+                    self.assertTrue(page.quality_mode_radio.isChecked())
+                    self.assertEqual(page.quality_slider.value(), 100)
+                    self.assertEqual(page.quality_spinbox.value(), 100)
+                    self.assertEqual(page.quality_spinbox.text(), "100")
+                self.assertTrue(window.feature_nav_items[MODE_WATERMARK].isHidden())
+                self.assertTrue(
+                    window.comprehensive_page.feature_sections[MODE_WATERMARK].isHidden()
+                )
+
+                window.comprehensive_page.watermark_checkbox.setChecked(True)
+                self.assertFalse(window.comprehensive_page._get_apply_watermark())
+                self.assertEqual(
+                    window.comprehensive_page._get_watermark_options(),
+                    (None, None),
+                )
+
+                for feature in (
+                    MODE_COMPREHENSIVE,
+                    MODE_RESIZE,
+                    MODE_FORMAT,
+                    MODE_COMPRESS,
+                    MODE_LOGO,
+                ):
+                    self.assertFalse(window.feature_nav_items[feature].isHidden())
+            finally:
+                self.close_window(window)
+
+    def test_switches_gate_comprehensive_features_and_persist(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "settings.ini"
+            window, settings = self.make_window(settings_path)
+            try:
+                window.settings_page.feature_switches[MODE_WATERMARK].setChecked(True)
+                window.settings_page.feature_switches[MODE_RESIZE].setChecked(False)
+                window.settings_page.feature_switches[MODE_FORMAT].setChecked(False)
+                window.settings_page.feature_switches[MODE_COMPRESS].setChecked(False)
+                window.settings_page.feature_switches[MODE_LOGO].setChecked(False)
+                self.process_events()
+
+                page = window.comprehensive_page
+                self.assertFalse(window.feature_nav_items[MODE_WATERMARK].isHidden())
+                self.assertFalse(page.feature_sections[MODE_WATERMARK].isHidden())
+                self.assertIsNone(page._get_output_size())
+                self.assertEqual(page._get_output_choice(), "保持原格式")
+                self.assertIsNone(page._get_compression_mode())
+                self.assertFalse(page._get_apply_logo())
+                self.assertTrue(page.output_card.isHidden())
+                self.assertTrue(page.feature_sections[MODE_LOGO].isHidden())
+
+                page.choose_save_radio.setChecked(True)
+                page._set_processing_state(True)
+                self.assertFalse(page.choose_save_button.isEnabled())
+                page.set_feature_enabled(MODE_FORMAT, True)
+                self.assertFalse(page.choose_save_button.isEnabled())
+                page._set_processing_state(False)
+                settings.sync()
+            finally:
+                self.close_window(window)
+
+            restored, _ = self.make_window(settings_path)
+            try:
+                self.assertTrue(restored.feature_states[MODE_WATERMARK])
+                self.assertFalse(restored.feature_states[MODE_RESIZE])
+                self.assertFalse(restored.feature_states[MODE_FORMAT])
+                self.assertFalse(restored.feature_states[MODE_COMPRESS])
+                self.assertFalse(restored.feature_states[MODE_LOGO])
+            finally:
+                self.close_window(restored)
+
+    def test_disabling_current_or_all_pages_keeps_settings_reachable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window, _ = self.make_window(Path(temp_dir) / "settings.ini")
+            try:
+                stacked_count = window.stackedWidget.count()
+                window.switchTo(window.logo_page)
+                window.switchTo(window.settings_page)
+                window.settings_page.feature_switches[MODE_LOGO].setChecked(False)
+                self.process_events()
+                self.assertIsNot(window.stackedWidget.currentWidget(), window.logo_page)
+                self.assertFalse(window.logo_page.isEnabled())
+                stack_history = qrouter.stackHistories[window.stackedWidget]
+                self.assertNotIn(window.logo_page.objectName(), stack_history.history)
+                self.assertFalse(
+                    any(
+                        item.stacked is window.stackedWidget
+                        and item.routeKey == window.logo_page.objectName()
+                        for item in qrouter.history
+                    )
+                )
+                window.navigationInterface.panel.returnButton.click()
+                QTest.qWait(400)
+                self.process_events()
+                self.assertIsNot(window.stackedWidget.currentWidget(), window.logo_page)
+
+                for switch in window.settings_page.feature_switches.values():
+                    switch.setChecked(False)
+                self.process_events()
+                self.assertIs(window.stackedWidget.currentWidget(), window.settings_page)
+                self.assertFalse(
+                    window.navigationInterface.widget(window.settings_page.objectName()).isHidden()
+                )
+
+                watermark_switch = window.settings_page.feature_switches[MODE_WATERMARK]
+                for _ in range(10):
+                    watermark_switch.setChecked(not watermark_switch.isChecked())
+                self.process_events()
+                self.assertEqual(window.stackedWidget.count(), stacked_count)
+            finally:
+                self.close_window(window)
+
+    def test_disabled_default_route_is_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "settings.ini"
+            settings = QSettings(str(settings_path), QSettings.IniFormat)
+            settings.setValue("features/comprehensive/enabled", False)
+            settings.sync()
+
+            window, _ = self.make_window(settings_path)
+            try:
+                stack_history = qrouter.stackHistories[window.stackedWidget]
+                self.assertNotEqual(
+                    stack_history.defaultRouteKey,
+                    window.comprehensive_page.objectName(),
+                )
+                self.assertIsNot(
+                    window.stackedWidget.currentWidget(),
+                    window.comprehensive_page,
+                )
+                self.assertFalse(window.comprehensive_page.isEnabled())
+            finally:
+                self.close_window(window)
+
+    def test_logo_grid_height_adapts_to_rows_and_is_bounded(self) -> None:
+        page = ImageOperationPage("LOGO", MODE_LOGO, "logoAdaptiveTest")
+        try:
+            page.resize(1060, 820)
+            page.show()
+            self.process_events()
+            for row in range(page.logo_list.count()):
+                item = page.logo_list.item(row)
+                self.assertLessEqual(
+                    page.logo_list.visualItemRect(item).height(),
+                    page.logo_list.gridSize().height(),
+                )
+                if page.logo_assets:
+                    self.assertFalse(item.icon().isNull())
+            page.logo_list.clear()
+            page.logo_list.addItem(QListWidgetItem("one-row"))
+            page.logo_list.sync_height()
+            self.process_events()
+            one_row_height = page.logo_list.height()
+            self.assertLessEqual(page.logo_card.height(), 300)
+
+            page.resize(800, 820)
+            for index in range(3):
+                page.logo_list.addItem(QListWidgetItem(f"second-row-{index}"))
+            page.logo_list.sync_height()
+            self.process_events()
+            two_row_height = page.logo_list.height()
+            self.assertGreater(two_row_height, one_row_height)
+
+            for index in range(8):
+                page.logo_list.addItem(QListWidgetItem(f"extra-{index}"))
+            page.logo_list.sync_height()
+            page.logo_list.doItemsLayout()
+            self.process_events()
+            self.assertEqual(page.logo_list.height(), two_row_height)
+            self.assertGreater(page.logo_list.verticalScrollBar().maximum(), 0)
+        finally:
+            page.shutdown()
+            page.close()
+            page.deleteLater()
+            self.process_events()
+
+    def test_feature_controls_resync_after_processing_cycle(self) -> None:
+        page = ImageOperationPage("综合处理", MODE_COMPREHENSIVE, "featureStateCycleTest")
+        try:
+            page.target_mode_radio.setChecked(True)
+            page.watermark_checkbox.setChecked(True)
+            page._update_custom_compression_state()
+            page._update_watermark_controls_state()
+            self.assertTrue(page.target_size_label.isEnabled())
+            self.assertFalse(page.quality_slider.isEnabled())
+            self.assertTrue(page.watermark_type_combo.isEnabled())
+
+            page.set_feature_enabled(MODE_COMPRESS, False)
+            page.set_feature_enabled(MODE_WATERMARK, False)
+            page._set_processing_state(True)
+            page._set_processing_state(False)
+            page.set_feature_enabled(MODE_COMPRESS, True)
+            page.set_feature_enabled(MODE_WATERMARK, True)
+
+            self.assertTrue(page.target_mode_radio.isChecked())
+            self.assertTrue(page.target_size_label.isEnabled())
+            self.assertTrue(page.custom_size_radio.isEnabled())
+            self.assertFalse(page.quality_slider.isEnabled())
+            self.assertTrue(page.watermark_checkbox.isChecked())
+            self.assertTrue(page.watermark_type_combo.isEnabled())
+            self.assertTrue(page.watermark_text_edit.isEnabled())
+        finally:
+            page.shutdown()
+            page.close()
+            page.deleteLater()
+            self.process_events()
+
+    def test_custom_output_size_is_bounded_before_processing(self) -> None:
+        page = ImageOperationPage("尺寸处理", MODE_RESIZE, "boundedOutputSizeTest")
+        try:
+            page.size_combo.setCurrentText(CUSTOM_SIZE_LABEL)
+            page.custom_width_edit.setText(str(MAX_OUTPUT_DIMENSION + 1))
+            page.custom_height_edit.setText("1")
+            self.assertIsNone(page._get_output_size())
+
+            page.custom_width_edit.setText(str(MAX_OUTPUT_DIMENSION))
+            page.custom_height_edit.setText(
+                str(MAX_OUTPUT_PIXELS // MAX_OUTPUT_DIMENSION + 1)
+            )
+            self.assertIsNone(page._get_output_size())
+
+            page.custom_width_edit.setText("8000")
+            page.custom_height_edit.setText("4000")
+            self.assertEqual(page._get_output_size(), (8000, 4000))
+        finally:
+            page.shutdown()
+            page.close()
+            page.deleteLater()
+            self.process_events()
+
+    def test_quality_slider_shows_live_numeric_value(self) -> None:
+        page = ImageOperationPage("图片压缩", MODE_COMPRESS, "qualityPercentageTest")
+        try:
+            page.quality_slider.setValue(73)
+            self.process_events()
+            self.assertEqual(page.quality_spinbox.value(), 73)
+            self.assertEqual(page.quality_spinbox.text(), "73")
+            self.assertGreaterEqual(
+                page.quality_spinbox.width(),
+                page.quality_spinbox.minimumSizeHint().width(),
+            )
+
+            page.quality_spinbox.setValue(41)
+            self.process_events()
+            self.assertEqual(page.quality_slider.value(), 41)
+            self.assertEqual(page.quality_spinbox.text(), "41")
+            expected_handle_x = int(
+                (41 - page.quality_slider.minimum())
+                / (page.quality_slider.maximum() - page.quality_slider.minimum())
+                * page.quality_slider.grooveLength
+            )
+            self.assertEqual(page.quality_slider.handle.x(), expected_handle_x)
+        finally:
+            page.shutdown()
+            page.close()
+            page.deleteLater()
+            self.process_events()
+
+    def test_logo_grid_exact_width_boundaries_match_qt_layout(self) -> None:
+        widget = AdaptiveLogoListWidget()
+        try:
+            widget.setViewMode(QListView.IconMode)
+            widget.setResizeMode(QListView.Adjust)
+            widget.setMovement(QListView.Static)
+            widget.setGridSize(QSize(140, 60))
+            for index in range(3):
+                widget.addItem(QListWidgetItem(f"logo-{index}"))
+            widget.show()
+            self.process_events()
+
+            frame_width = widget.frameWidth() * 2
+            widget.setFixedWidth(420 + frame_width)
+            widget.sync_height()
+            widget.doItemsLayout()
+            self.process_events()
+            self.assertEqual(widget.height(), 120 + frame_width)
+            self.assertEqual(widget.verticalScrollBar().maximum(), 0)
+
+            widget.setFixedWidth(421 + frame_width)
+            widget.sync_height()
+            widget.doItemsLayout()
+            self.process_events()
+            self.assertEqual(widget.height(), 60 + frame_width)
+            self.assertEqual(widget.verticalScrollBar().maximum(), 0)
+            self.assertEqual(widget.horizontalScrollBar().maximum(), 0)
+        finally:
+            widget.close()
+            widget.deleteLater()
+            self.process_events()
+
+
+if __name__ == "__main__":
+    unittest.main()

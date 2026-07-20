@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
 from compressor import CompressionResult, compress_image_to_bytes, save_image_to_bytes
-from config import WATERMARK_POSITION_CUSTOM, WATERMARK_POSITION_TILE, WATERMARK_TYPE_IMAGE, WATERMARK_TYPE_TEXT
+from config import (
+    MAX_OUTPUT_DIMENSION,
+    MAX_OUTPUT_PIXELS,
+    MAX_MANUAL_QUALITY,
+    MIN_MANUAL_QUALITY,
+    WATERMARK_POSITION_CUSTOM,
+    WATERMARK_POSITION_TILE,
+    WATERMARK_TYPE_IMAGE,
+    WATERMARK_TYPE_TEXT,
+)
 from file_utils import get_file_size
 
 
@@ -48,6 +58,20 @@ class ProcessOptions:
     apply_logo: bool
     logos: list[Image.Image]
     watermark_options: WatermarkOptions | None = None
+    quality: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.output_size is not None:
+            _validate_output_size(self.output_size)
+        if self.target_size is not None and self.quality is not None:
+            raise ValueError("target_size and quality are mutually exclusive")
+        if self.quality is not None:
+            if isinstance(self.quality, bool) or not isinstance(self.quality, int):
+                raise ValueError("quality must be an integer")
+            if not MIN_MANUAL_QUALITY <= self.quality <= MAX_MANUAL_QUALITY:
+                raise ValueError(
+                    f"quality must be between {MIN_MANUAL_QUALITY} and {MAX_MANUAL_QUALITY}"
+                )
 
 
 @dataclass(frozen=True)
@@ -57,6 +81,12 @@ class ProcessResult:
     exceeded: bool
     compression: CompressionResult
     dimensions: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class EncodedPreviewResult:
+    image: Image.Image
+    compression: CompressionResult
 
 
 def get_image_info(path: str | Path) -> ImageInfo:
@@ -74,28 +104,9 @@ def get_image_info(path: str | Path) -> ImageInfo:
 
 
 def process_image(source_path: str | Path, output_path: str | Path, options: ProcessOptions) -> ProcessResult:
-    source = Path(source_path)
     target = Path(output_path)
-
-    try:
-        with Image.open(source) as original:
-            image = ImageOps.exif_transpose(original)
-            working = _prepare_image(image, options.output_size)
-    except (UnidentifiedImageError, OSError, ValueError) as exc:
-        raise RuntimeError("图片无法打开") from exc
-
-    if options.apply_logo:
-        if not options.logos:
-            raise RuntimeError("内置LOGO加载失败")
-        working = overlay_logos(working, options.logos)
-
-    if options.watermark_options is not None:
-        working = apply_watermark(working, options.watermark_options)
-
-    if options.target_size is None:
-        compression = save_image_to_bytes(working, options.output_format)
-    else:
-        compression = compress_image_to_bytes(working, options.output_format, options.target_size)
+    working = _render_working_image(source_path, options)
+    compression = _encode_working_image(working, options)
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(compression.data)
@@ -110,6 +121,27 @@ def process_image(source_path: str | Path, output_path: str | Path, options: Pro
 
 
 def render_preview_image(source_path: str | Path, options: ProcessOptions) -> Image.Image:
+    return _preview_display_image(_render_working_image(source_path, options))
+
+
+def render_encoded_preview_image(
+    source_path: str | Path,
+    options: ProcessOptions,
+) -> EncodedPreviewResult:
+    working = _render_working_image(source_path, options)
+    compression = _encode_working_image(working, options)
+
+    with Image.open(BytesIO(compression.data)) as encoded:
+        encoded.load()
+        decoded = encoded.copy()
+
+    return EncodedPreviewResult(
+        image=_preview_display_image(decoded),
+        compression=compression,
+    )
+
+
+def _render_working_image(source_path: str | Path, options: ProcessOptions) -> Image.Image:
     source = Path(source_path)
 
     try:
@@ -127,11 +159,17 @@ def render_preview_image(source_path: str | Path, options: ProcessOptions) -> Im
     if options.watermark_options is not None:
         working = apply_watermark(working, options.watermark_options)
 
-    return _preview_display_image(working)
+    return working
+
+
+def _encode_working_image(image: Image.Image, options: ProcessOptions) -> CompressionResult:
+    if options.target_size is not None:
+        return compress_image_to_bytes(image, options.output_format, options.target_size)
+    return save_image_to_bytes(image, options.output_format, quality=options.quality)
 
 
 def create_canvas(image: Image.Image, output_size: tuple[int, int]) -> Image.Image:
-    width, height = output_size
+    width, height = _validate_output_size(output_size)
     normalized = image.convert("RGBA")
     resized = ImageOps.contain(
         normalized,
@@ -148,15 +186,15 @@ def create_canvas(image: Image.Image, output_size: tuple[int, int]) -> Image.Ima
 
 def overlay_logos(image: Image.Image, logos: list[Image.Image]) -> Image.Image:
     has_alpha = _has_alpha(image)
-    result = image.convert("RGBA") if has_alpha else image.convert("RGB")
+    result = image.convert("RGBA")
 
     for logo in logos:
         logo_image = logo.convert("RGBA")
         if logo_image.size != result.size:
             logo_image = logo_image.resize(result.size, Image.Resampling.LANCZOS)
-        result.paste(logo_image, (0, 0), logo_image)
+        result = Image.alpha_composite(result, logo_image)
 
-    return result
+    return result if has_alpha else result.convert("RGB")
 
 
 def apply_watermark(image: Image.Image, options: WatermarkOptions) -> Image.Image:
@@ -278,13 +316,8 @@ def _paste_tiled(
 ) -> None:
     step_x = max(1, layer.width + spacing_x)
     step_y = max(1, layer.height + spacing_y)
-    start_x = offset_x
-    start_y = offset_y
-
-    while start_x > 0:
-        start_x -= step_x
-    while start_y > 0:
-        start_y -= step_y
+    start_x = _normalize_tile_offset(offset_x, step_x)
+    start_y = _normalize_tile_offset(offset_y, step_y)
 
     y = start_y
     while y < overlay.height:
@@ -293,6 +326,12 @@ def _paste_tiled(
             _alpha_composite_clipped(overlay, layer, x, y)
             x += step_x
         y += step_y
+
+
+def _normalize_tile_offset(offset: int, step: int) -> int:
+    """Return the equivalent tile origin nearest to, and not after, zero."""
+    normalized = offset % step
+    return normalized - step if normalized else 0
 
 
 def _position_for_layer(
@@ -357,6 +396,30 @@ def _preview_display_image(image: Image.Image) -> Image.Image:
     canvas = Image.new("RGB", rgba.size, "white")
     canvas.paste(rgba, (0, 0), rgba)
     return canvas
+
+
+def _validate_output_size(output_size: tuple[int, int]) -> tuple[int, int]:
+    try:
+        width, height = output_size
+    except (TypeError, ValueError) as exc:
+        raise ValueError("output_size must contain width and height") from exc
+
+    if (
+        isinstance(width, bool)
+        or isinstance(height, bool)
+        or not isinstance(width, int)
+        or not isinstance(height, int)
+        or width <= 0
+        or height <= 0
+    ):
+        raise ValueError("output dimensions must be positive integers")
+    if width > MAX_OUTPUT_DIMENSION or height > MAX_OUTPUT_DIMENSION:
+        raise ValueError(
+            f"output dimensions cannot exceed {MAX_OUTPUT_DIMENSION} pixels per side"
+        )
+    if width * height > MAX_OUTPUT_PIXELS:
+        raise ValueError(f"output image cannot exceed {MAX_OUTPUT_PIXELS} pixels")
+    return width, height
 
 
 def _has_alpha(image: Image.Image) -> bool:
