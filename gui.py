@@ -28,6 +28,7 @@ from PySide6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
     QIcon,
+    QKeyEvent,
     QMouseEvent,
     QPalette,
     QPixmap,
@@ -57,6 +58,7 @@ from qfluentwidgets import (
     FluentIcon as FIF,
     FluentStyleSheet,
     FluentWindow,
+    IconWidget,
     InfoBar,
     InfoBarPosition,
     LineEdit,
@@ -121,6 +123,9 @@ from config import (
     MIN_MANUAL_QUALITY,
     OUTPUT_FORMATS,
     OUTPUT_SIZE_PRESETS,
+    PROJECT_ISSUES_URL,
+    PROJECT_RELEASES_URL,
+    PROJECT_URL,
     STATUS_CANCELED,
     STATUS_EXCEEDED,
     STATUS_FAILED,
@@ -190,6 +195,7 @@ STATUS_COLUMN = 5
 PREVIEW_SIDEBAR_EXPANDED_WIDTH = 340
 PREVIEW_SIDEBAR_COLLAPSED_WIDTH = 48
 PREVIEW_SIDEBAR_ANIMATION_MS = 180
+ABOUT_CONTENT_MAX_WIDTH = 900
 
 THEME_SETTING_KEY = "themeMode"
 STATISTICS_PROCESSED_COUNT_KEY = "statistics/processed_count"
@@ -219,6 +225,7 @@ def theme_colors() -> dict[str, str]:
             "preview_border": "#3f3f46",
             "preview": "#202124",
             "preview_text": "#cfcfcf",
+            "accent_text": "#62dbe2",
         }
 
     return {
@@ -230,6 +237,7 @@ def theme_colors() -> dict[str, str]:
         "preview_border": "#d9d9d9",
         "preview": "#fafafa",
         "preview_text": "#666666",
+        "accent_text": "#007f86",
     }
 
 
@@ -301,6 +309,34 @@ def theme_stylesheet() -> str:
         #StatisticsValue {{
             font-size: 20px;
             font-weight: 600;
+        }}
+        #AboutProductTitle {{
+            font-size: 22px;
+            font-weight: 600;
+        }}
+        #AboutTagline {{
+            font-size: 14px;
+            color: {colors["muted"]};
+        }}
+        #AboutVersionBadge {{
+            background: transparent;
+            border: 1px solid {colors["muted"]};
+            border-radius: 6px;
+        }}
+        #AboutPrivacyLead {{
+            color: {colors["accent_text"]};
+            font-size: 14px;
+            font-weight: 600;
+        }}
+        #AboutDivider {{
+            background: {colors["card_border"]};
+            border: none;
+        }}
+        #AboutActionText {{
+            font-size: 14px;
+        }}
+        #AboutFooter {{
+            color: {colors["muted"]};
         }}
         #MutedLabel {{
             color: {colors["muted"]};
@@ -2918,6 +2954,54 @@ class SettingsPage(QWidget):
         self.on_theme_changed(THEME_LABELS.get(label, "light"))
 
 
+class AboutActionButton(PushButton):
+    """Native button styled as the full-width About page action row."""
+
+    def __init__(
+        self,
+        text: str,
+        icon,
+        accessible_description: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("AboutActionButton")
+        self.setText("")
+        self.setFixedHeight(50)
+        self.setAccessibleName(text)
+        self.setAccessibleDescription(accessible_description)
+        self.setToolTip(accessible_description)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 0, 12, 0)
+        layout.setSpacing(12)
+
+        self.icon_widget = IconWidget(self)
+        self.icon_widget.setIcon(icon)
+        self.icon_widget.setFixedSize(20, 20)
+        self.text_label = QLabel(text, self)
+        self.text_label.setObjectName("AboutActionText")
+        self.arrow_widget = IconWidget(self)
+        self.arrow_widget.setIcon(FIF.CHEVRON_RIGHT)
+        self.arrow_widget.setFixedSize(16, 16)
+
+        for child in (self.icon_widget, self.text_label, self.arrow_widget):
+            child.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        layout.addWidget(self.icon_widget)
+        layout.addWidget(self.text_label)
+        layout.addStretch(1)
+        layout.addWidget(self.arrow_widget)
+
+    def keyReleaseEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if not event.isAutoRepeat():
+                self.click()
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+
 class AboutPage(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -2932,45 +3016,165 @@ class AboutPage(QWidget):
         title.setObjectName("TitleLabel")
         root_layout.addWidget(title)
 
-        info_card = CardWidget(self)
-        info_card.setObjectName("PanelCard")
-        info_layout = QVBoxLayout(info_card)
-        info_layout.setContentsMargins(18, 16, 18, 16)
-        info_layout.setSpacing(10)
+        self.content_widget = QWidget(self)
+        self.content_widget.setObjectName("AboutContent")
+        self.content_widget.setMaximumWidth(ABOUT_CONTENT_MAX_WIDTH)
+        self.content_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        content_layout = QVBoxLayout(self.content_widget)
+        content_layout.setContentsMargins(0, 4, 0, 0)
+        content_layout.setSpacing(22)
 
-        section_title = QLabel(APP_NAME, self)
-        section_title.setObjectName("SectionTitle")
-        info_layout.addWidget(section_title)
-        self._add_info_row(info_layout, "作者", APP_AUTHOR)
-        self._add_info_row(info_layout, "版本", APP_VERSION)
+        identity_widget = QWidget(self.content_widget)
+        identity_layout = QVBoxLayout(identity_widget)
+        identity_layout.setContentsMargins(0, 0, 0, 0)
+        identity_layout.setSpacing(6)
 
-        feature_card = CardWidget(self)
-        feature_card.setObjectName("PanelCard")
-        feature_layout = QVBoxLayout(feature_card)
-        feature_layout.setContentsMargins(18, 16, 18, 16)
-        feature_layout.setSpacing(10)
+        self.product_title_label = QLabel(APP_NAME, identity_widget)
+        self.product_title_label.setObjectName("AboutProductTitle")
+        self.tagline_label = QLabel("本地、批量、可预览的图片处理工具", identity_widget)
+        self.tagline_label.setObjectName("AboutTagline")
+        self.tagline_label.setWordWrap(True)
 
-        feature_title = QLabel("功能", self)
-        feature_title.setObjectName("SectionTitle")
-        feature_layout.addWidget(feature_title)
-        feature_text = QLabel("图片导入、尺寸处理、格式转换、图片压缩、LOGO叠加、水印、预览、主题", self)
-        feature_text.setWordWrap(True)
-        feature_layout.addWidget(feature_text)
+        metadata_row = QHBoxLayout()
+        metadata_row.setContentsMargins(0, 6, 0, 0)
+        metadata_row.setSpacing(12)
+        self.version_badge = QFrame(identity_widget)
+        self.version_badge.setObjectName("AboutVersionBadge")
+        self.version_badge.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        version_layout = QHBoxLayout(self.version_badge)
+        version_layout.setContentsMargins(10, 3, 10, 3)
+        self.version_label = QLabel(APP_VERSION, self.version_badge)
+        version_layout.addWidget(self.version_label)
+        self.author_label = QLabel(APP_AUTHOR, identity_widget)
+        self.author_label.setObjectName("MutedLabel")
+        metadata_row.addWidget(self.version_badge)
+        metadata_row.addWidget(self.author_label)
+        metadata_row.addStretch(1)
 
-        root_layout.addWidget(info_card)
-        root_layout.addWidget(feature_card)
+        identity_layout.addWidget(self.product_title_label)
+        identity_layout.addWidget(self.tagline_label)
+        identity_layout.addLayout(metadata_row)
+        content_layout.addWidget(identity_widget)
+
+        self.about_panel = CardWidget(self.content_widget)
+        self.about_panel.setObjectName("PanelCard")
+        panel_layout = QVBoxLayout(self.about_panel)
+        panel_layout.setContentsMargins(20, 18, 20, 20)
+        panel_layout.setSpacing(12)
+
+        self.privacy_title_label = QLabel("隐私与安全", self.about_panel)
+        self.privacy_title_label.setObjectName("SectionTitle")
+        self.privacy_lead_label = QLabel("所有图片均在本机完成处理", self.about_panel)
+        self.privacy_lead_label.setObjectName("AboutPrivacyLead")
+        self.no_overwrite_label = QLabel("输出文件不会覆盖原图", self.about_panel)
+        self.no_path_storage_label = QLabel("不保存图片名称或路径", self.about_panel)
+        panel_layout.addWidget(self.privacy_title_label)
+        panel_layout.addWidget(self.privacy_lead_label)
+        panel_layout.addWidget(self.no_overwrite_label)
+        panel_layout.addWidget(self.no_path_storage_label)
+
+        self.divider = QFrame(self.about_panel)
+        self.divider.setObjectName("AboutDivider")
+        self.divider.setFrameShape(QFrame.HLine)
+        self.divider.setFixedHeight(1)
+        panel_layout.addWidget(self.divider)
+
+        self.support_title_label = QLabel("帮助与支持", self.about_panel)
+        self.support_title_label.setObjectName("SectionTitle")
+        panel_layout.addWidget(self.support_title_label)
+
+        action_grid = QGridLayout()
+        action_grid.setContentsMargins(0, 0, 0, 0)
+        action_grid.setHorizontalSpacing(10)
+        action_grid.setVerticalSpacing(10)
+        action_grid.setColumnStretch(0, 1)
+        action_grid.setColumnStretch(1, 1)
+
+        self.project_action = AboutActionButton(
+            "项目主页",
+            FIF.HOME,
+            "在浏览器中打开项目主页",
+            self.about_panel,
+        )
+        self.release_action = AboutActionButton(
+            "查看最新版本",
+            FIF.SYNC,
+            "在浏览器中查看最新版本",
+            self.about_panel,
+        )
+        self.feedback_action = AboutActionButton(
+            "反馈问题",
+            FIF.MESSAGE,
+            "在浏览器中打开问题反馈页面",
+            self.about_panel,
+        )
+        self.copy_version_action = AboutActionButton(
+            "复制版本信息",
+            FIF.COPY,
+            "复制软件名称、版本和作者",
+            self.about_panel,
+        )
+        self.action_cards = (
+            self.project_action,
+            self.release_action,
+            self.feedback_action,
+            self.copy_version_action,
+        )
+
+        action_grid.addWidget(self.project_action, 0, 0)
+        action_grid.addWidget(self.release_action, 0, 1)
+        action_grid.addWidget(self.feedback_action, 1, 0)
+        action_grid.addWidget(self.copy_version_action, 1, 1)
+        panel_layout.addLayout(action_grid)
+        content_layout.addWidget(self.about_panel)
+
+        self.footer_label = QLabel(
+            f"{APP_NAME}  ·  {APP_VERSION}  ·  {APP_AUTHOR}",
+            self.content_widget,
+        )
+        self.footer_label.setObjectName("AboutFooter")
+        content_layout.addWidget(self.footer_label)
+
+        root_layout.addWidget(self.content_widget)
         root_layout.addStretch(1)
+
+        self.project_action.clicked.connect(
+            lambda: self._open_external_url(PROJECT_URL)
+        )
+        self.release_action.clicked.connect(
+            lambda: self._open_external_url(PROJECT_RELEASES_URL)
+        )
+        self.feedback_action.clicked.connect(
+            lambda: self._open_external_url(PROJECT_ISSUES_URL)
+        )
+        self.copy_version_action.clicked.connect(self._copy_version_information)
         self.apply_theme_styles()
 
-    def _add_info_row(self, layout: QVBoxLayout, label: str, value: str) -> None:
-        row = QHBoxLayout()
-        row.setSpacing(10)
-        row.addWidget(QLabel(label, self))
-        value_label = QLabel(value, self)
-        value_label.setObjectName("MutedLabel")
-        row.addWidget(value_label)
-        row.addStretch(1)
-        layout.addLayout(row)
+    @staticmethod
+    def version_information_text() -> str:
+        return f"{APP_NAME} {APP_VERSION}\n作者：{APP_AUTHOR}"
+
+    def _open_external_url(self, url: str) -> None:
+        if QDesktopServices.openUrl(QUrl(url)):
+            return
+        self._show_message("error", "无法打开浏览器")
+
+    def _copy_version_information(self) -> None:
+        QApplication.clipboard().setText(self.version_information_text())
+        self._show_message("success", "版本信息已复制")
+
+    def _show_message(self, level: str, content: str) -> None:
+        kwargs = dict(
+            title="提示",
+            content=content,
+            duration=2200,
+            position=InfoBarPosition.TOP_RIGHT,
+            parent=self.window(),
+        )
+        if level == "success":
+            InfoBar.success(**kwargs)
+        else:
+            InfoBar.error(**kwargs)
 
     def apply_theme_styles(self) -> None:
         apply_background(self, theme_colors()["page"])

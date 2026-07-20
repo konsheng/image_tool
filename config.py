@@ -1,6 +1,9 @@
 APP_NAME = "图片处理工具"
 APP_AUTHOR = "Konsheng"
 APP_VERSION = "v1.0.0"
+PROJECT_URL = "https://github.com/konsheng/image_tool"
+PROJECT_RELEASES_URL = f"{PROJECT_URL}/releases/latest"
+PROJECT_ISSUES_URL = f"{PROJECT_URL}/issues/new"
 
 OUTPUT_SIZE_PRESETS = [
     (800, 800),
