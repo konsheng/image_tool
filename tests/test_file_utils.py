@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from file_utils import ensure_unique_path
+from file_utils import bytes_to_display, ensure_unique_path
 
 
 class EnsureUniquePathTestCase(unittest.TestCase):
@@ -18,6 +18,10 @@ class EnsureUniquePathTestCase(unittest.TestCase):
 
             self.assertNotEqual(first, second)
             self.assertEqual(len(reserved), 2)
+
+    def test_bytes_to_display_supports_cumulative_sizes(self) -> None:
+        self.assertEqual(bytes_to_display(8_600_000_000), "8.6GB")
+        self.assertEqual(bytes_to_display(12_500_000_000_000), "12.5TB")
 
 
 if __name__ == "__main__":

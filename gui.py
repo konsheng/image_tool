@@ -192,6 +192,9 @@ PREVIEW_SIDEBAR_COLLAPSED_WIDTH = 48
 PREVIEW_SIDEBAR_ANIMATION_MS = 180
 
 THEME_SETTING_KEY = "themeMode"
+STATISTICS_PROCESSED_COUNT_KEY = "statistics/processed_count"
+STATISTICS_SOURCE_BYTES_KEY = "statistics/source_bytes"
+STATISTICS_OUTPUT_BYTES_KEY = "statistics/output_bytes"
 THEME_LABELS = {
     "浅色": "light",
     "暗色": "dark",
@@ -294,6 +297,10 @@ def theme_stylesheet() -> str:
             font-size: 15px;
             font-weight: 600;
             padding-bottom: 4px;
+        }}
+        #StatisticsValue {{
+            font-size: 20px;
+            font-weight: 600;
         }}
         #MutedLabel {{
             color: {colors["muted"]};
@@ -447,6 +454,56 @@ class ProcessingTask:
 
 
 @dataclass(frozen=True)
+class ProcessedOutput:
+    source_bytes: int
+    output_bytes: int
+
+
+@dataclass(frozen=True)
+class ProcessingStatistics:
+    processed_count: int = 0
+    source_bytes: int = 0
+    output_bytes: int = 0
+
+    @property
+    def net_saved_bytes(self) -> int:
+        return self.source_bytes - self.output_bytes
+
+    def with_output(self, output: ProcessedOutput) -> ProcessingStatistics:
+        return ProcessingStatistics(
+            processed_count=self.processed_count + 1,
+            source_bytes=self.source_bytes + output.source_bytes,
+            output_bytes=self.output_bytes + output.output_bytes,
+        )
+
+
+def _load_nonnegative_setting(settings: QSettings, key: str) -> int:
+    try:
+        return max(0, int(str(settings.value(key, "0")).strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def load_processing_statistics(settings: QSettings) -> ProcessingStatistics:
+    return ProcessingStatistics(
+        processed_count=_load_nonnegative_setting(settings, STATISTICS_PROCESSED_COUNT_KEY),
+        source_bytes=_load_nonnegative_setting(settings, STATISTICS_SOURCE_BYTES_KEY),
+        output_bytes=_load_nonnegative_setting(settings, STATISTICS_OUTPUT_BYTES_KEY),
+    )
+
+
+def save_processing_statistics(
+    settings: QSettings,
+    statistics: ProcessingStatistics,
+) -> None:
+    # Decimal strings preserve Python's unbounded counters across Qt backends.
+    settings.setValue(STATISTICS_PROCESSED_COUNT_KEY, str(statistics.processed_count))
+    settings.setValue(STATISTICS_SOURCE_BYTES_KEY, str(statistics.source_bytes))
+    settings.setValue(STATISTICS_OUTPUT_BYTES_KEY, str(statistics.output_bytes))
+    settings.sync()
+
+
+@dataclass(frozen=True)
 class PageSettings:
     output_size: tuple[int, int] | None
     output_choice: str
@@ -528,6 +585,7 @@ class PreviewWorker(QObject):
 class ProcessingWorker(QObject):
     item_started = Signal(int, str)
     item_finished = Signal(int, str)
+    output_committed = Signal(object)
     progress_changed = Signal(int, int, str, int, int, int)
     finished = Signal(int, int, int, int, object, bool)
 
@@ -565,6 +623,7 @@ class ProcessingWorker(QObject):
             self.item_started.emit(task.row, file_name)
 
             try:
+                source_size = task.source_path.stat().st_size
                 logo_copies: list[Image.Image] = []
                 if task.apply_logo:
                     for asset in task.logo_assets:
@@ -586,6 +645,16 @@ class ProcessingWorker(QObject):
                     ),
                 )
                 last_output_dir = result.output_path.parent
+                try:
+                    output_size = result.output_path.stat().st_size
+                except OSError:
+                    output_size = result.output_size
+                self.output_committed.emit(
+                    ProcessedOutput(
+                        source_bytes=source_size,
+                        output_bytes=output_size,
+                    )
+                )
                 if result.exceeded:
                     warning += 1
                     status = f"{STATUS_EXCEEDED}：最终 {bytes_to_display(result.output_size)}"
@@ -619,6 +688,7 @@ class ProcessingWorker(QObject):
 
 class ImageOperationPage(QWidget):
     preview_collapse_requested = Signal(bool)
+    output_committed = Signal(object)
 
     def __init__(self, page_title: str, mode: str, object_name: str) -> None:
         super().__init__()
@@ -758,7 +828,13 @@ class ImageOperationPage(QWidget):
         title.setObjectName("TitleLabel")
         layout.addWidget(title)
 
+        self.statistics_card: CardWidget | None = None
+        if self.mode == MODE_COMPREHENSIVE:
+            self.statistics_card = self._build_statistics_card()
+            layout.addWidget(self.statistics_card)
+
         list_card, list_layout = self._create_card("图片列表")
+        self.list_card = list_card
         button_row = QHBoxLayout()
         button_row.setSpacing(10)
         self.import_button = self._create_button(PrimaryPushButton, "导入图片", FIF.ADD)
@@ -1288,6 +1364,49 @@ class ImageOperationPage(QWidget):
         path_row.addWidget(self.save_path_label, 1)
         layout.addLayout(path_row)
         return card
+
+    def _build_statistics_card(self) -> CardWidget:
+        card = CardWidget(self)
+        card.setObjectName("PanelCard")
+        card.setToolTip("统计所有功能页成功生成的图片")
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(18, 12, 18, 12)
+        layout.setSpacing(36)
+
+        count_block = QVBoxLayout()
+        count_block.setSpacing(2)
+        count_caption = QLabel("累计处理图片", self)
+        count_caption.setObjectName("MutedLabel")
+        self.statistics_count_label = QLabel("0 张", self)
+        self.statistics_count_label.setObjectName("StatisticsValue")
+        count_block.addWidget(count_caption)
+        count_block.addWidget(self.statistics_count_label)
+
+        space_block = QVBoxLayout()
+        space_block.setSpacing(2)
+        self.statistics_space_caption = QLabel("累计净节省空间", self)
+        self.statistics_space_caption.setObjectName("MutedLabel")
+        self.statistics_space_label = QLabel("0B", self)
+        self.statistics_space_label.setObjectName("StatisticsValue")
+        space_block.addWidget(self.statistics_space_caption)
+        space_block.addWidget(self.statistics_space_label)
+
+        layout.addLayout(count_block)
+        layout.addLayout(space_block)
+        layout.addStretch(1)
+        return card
+
+    def set_processing_statistics(self, statistics: ProcessingStatistics) -> None:
+        if self.mode != MODE_COMPREHENSIVE or self.statistics_card is None:
+            return
+
+        self.statistics_count_label.setText(f"{statistics.processed_count:,} 张")
+        net_saved = statistics.net_saved_bytes
+        if net_saved >= 0:
+            self.statistics_space_caption.setText("累计净节省空间")
+        else:
+            self.statistics_space_caption.setText("累计净增加空间")
+        self.statistics_space_label.setText(bytes_to_display(abs(net_saved)))
 
     def _add_readonly_row(self, layout: QVBoxLayout, label: str, value: str) -> None:
         row = QHBoxLayout()
@@ -2155,6 +2274,7 @@ class ImageOperationPage(QWidget):
         self.worker_thread.started.connect(self.worker.run)
         self.worker.item_started.connect(self._on_item_started)
         self.worker.item_finished.connect(self._on_item_finished)
+        self.worker.output_committed.connect(self._forward_output_committed)
         self.worker.progress_changed.connect(self._on_progress_changed)
         self.worker.finished.connect(self._on_processing_finished)
         self.worker.finished.connect(lambda *_: self.worker_thread.quit())
@@ -2169,6 +2289,9 @@ class ImageOperationPage(QWidget):
         self.worker.request_cancel()
         self.cancel_button.setEnabled(False)
         self.progress_text.setText(self.progress_text.text() + "    正在取消")
+
+    def _forward_output_committed(self, output: object) -> None:
+        self.output_committed.emit(output)
 
     def _get_page_settings(self) -> PageSettings | None:
         output_size = self._get_output_size()
@@ -2859,6 +2982,7 @@ class ImageToolWindow(FluentWindow):
         settings = settings or QSettings("ImageTool", APP_NAME)
         theme_value = load_theme_value(settings)
         feature_states = load_feature_states(settings)
+        processing_statistics = load_processing_statistics(settings)
         setTheme(THEME_MAP[theme_value])
 
         super().__init__()
@@ -2878,6 +3002,7 @@ class ImageToolWindow(FluentWindow):
         self.settings = settings
         self.theme_value = theme_value
         self.feature_states = feature_states
+        self.processing_statistics = processing_statistics
         self.preview_collapsed = False
 
         self.setWindowTitle(APP_NAME)
@@ -2921,6 +3046,9 @@ class ImageToolWindow(FluentWindow):
 
         for page in self.operation_pages:
             page.preview_collapse_requested.connect(self._set_preview_sidebar_collapsed)
+            page.output_committed.connect(self._record_processed_output)
+
+        self.comprehensive_page.set_processing_statistics(self.processing_statistics)
 
         feature_navigation = (
             (MODE_COMPREHENSIVE, self.comprehensive_page, FIF.HOME),
@@ -2979,6 +3107,9 @@ class ImageToolWindow(FluentWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         for page in self.operation_pages:
             page.shutdown()
+        # Flush queued per-image completion signals after workers have stopped,
+        # so closing during a batch does not lose an already-written result.
+        QApplication.processEvents()
         qrouter.history = [
             item for item in qrouter.history if item.stacked is not self.stackedWidget
         ]
@@ -3053,6 +3184,16 @@ class ImageToolWindow(FluentWindow):
         self.settings.setValue(THEME_SETTING_KEY, value)
         setTheme(THEME_MAP[value])
         self._apply_theme_styles()
+
+    def _record_processed_output(self, output: object) -> None:
+        if not isinstance(output, ProcessedOutput):
+            return
+        if output.source_bytes < 0 or output.output_bytes < 0:
+            return
+
+        self.processing_statistics = self.processing_statistics.with_output(output)
+        save_processing_statistics(self.settings, self.processing_statistics)
+        self.comprehensive_page.set_processing_statistics(self.processing_statistics)
 
     def _set_preview_sidebar_collapsed(self, collapsed: bool) -> None:
         self.preview_collapsed = collapsed

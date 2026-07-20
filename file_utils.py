@@ -14,15 +14,21 @@ def is_supported_image(path: str | Path) -> bool:
 def bytes_to_display(size: int | None) -> str:
     if size is None:
         return "-"
-    if size >= 1_000_000:
-        value = size / 1_000_000
-        text = f"{value:.2f}" if value < 10 else f"{value:.1f}"
-        return f"{text.rstrip('0').rstrip('.')}MB"
-    if size >= 1_000:
-        value = size / 1_000
+
+    units = ("B", "KB", "MB", "GB", "TB", "PB")
+    value = float(size)
+    unit_index = 0
+    while abs(value) >= 1_000 and unit_index < len(units) - 1:
+        value /= 1_000
+        unit_index += 1
+
+    if unit_index == 0:
+        return f"{size}B"
+    if unit_index == 1:
         text = f"{value:.1f}"
-        return f"{text.rstrip('0').rstrip('.')}KB"
-    return f"{size}B"
+    else:
+        text = f"{value:.2f}" if abs(value) < 10 else f"{value:.1f}"
+    return f"{text.rstrip('0').rstrip('.')}{units[unit_index]}"
 
 
 def format_dimensions(width: int | None, height: int | None) -> str:
