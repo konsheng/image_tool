@@ -1120,14 +1120,16 @@ class ImageOperationPage(QWidget):
 
         if self.has_compression_controls:
             compression_layout = self._feature_section_layout(card, layout, MODE_COMPRESS)
-            quality_row = QHBoxLayout()
-            self.quality_label = QLabel("压缩质量", self)
-            self.quality_slider = Slider(self)
+            self.quality_controls_container = QWidget(card)
+            quality_row = QHBoxLayout(self.quality_controls_container)
+            quality_row.setContentsMargins(0, 0, 0, 0)
+            self.quality_label = QLabel("压缩质量", self.quality_controls_container)
+            self.quality_slider = Slider(self.quality_controls_container)
             self.quality_slider.setOrientation(Qt.Horizontal)
             self.quality_slider.setRange(MIN_MANUAL_QUALITY, MAX_MANUAL_QUALITY)
             self.quality_slider.setValue(DEFAULT_MANUAL_QUALITY)
             self.quality_slider.setMinimumWidth(120)
-            self.quality_spinbox = SpinBox(self)
+            self.quality_spinbox = SpinBox(self.quality_controls_container)
             self.quality_spinbox.setRange(MIN_MANUAL_QUALITY, MAX_MANUAL_QUALITY)
             self.quality_spinbox.setValue(DEFAULT_MANUAL_QUALITY)
             self.quality_spinbox.setFixedWidth(160)
@@ -1144,7 +1146,7 @@ class ImageOperationPage(QWidget):
             quality_row.addWidget(self.quality_spinbox)
             quality_row.addWidget(self.quality_reset_button)
             quality_row.addStretch(1)
-            compression_layout.addLayout(quality_row)
+            compression_layout.addWidget(self.quality_controls_container)
 
             self.compression_hint_label = QLabel(
                 "质量设置仅适用于 JPG/WEBP；PNG 将使用无损编码。",
@@ -1767,7 +1769,7 @@ class ImageOperationPage(QWidget):
         self.preview_timer.stop()
         self.pending_preview_request = None
         self.preview_pending_ready = False
-        self._update_compression_format_hint()
+        self._update_compression_controls_state()
 
         rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
         if not rows:
@@ -2088,8 +2090,11 @@ class ImageOperationPage(QWidget):
         if not self.has_compression_controls:
             return
 
+        quality_visible = self._quality_controls_are_applicable()
+        self.quality_controls_container.setVisible(quality_visible)
         quality_enabled = (
-            self.is_feature_enabled(MODE_COMPRESS)
+            quality_visible
+            and self.is_feature_enabled(MODE_COMPRESS)
             and not self.processing_active
         )
         self.quality_label.setEnabled(quality_enabled)
@@ -2118,28 +2123,38 @@ class ImageOperationPage(QWidget):
 
     def _update_quality_reset_button_state(self) -> None:
         enabled = (
-            self.is_feature_enabled(MODE_COMPRESS)
+            not self.quality_controls_container.isHidden()
+            and self.is_feature_enabled(MODE_COMPRESS)
             and not self.processing_active
             and self.quality_spinbox.value() != DEFAULT_MANUAL_QUALITY
         )
         self.quality_reset_button.setEnabled(enabled)
 
+    def _compression_output_formats(self) -> set[str]:
+        output_choice = self._get_output_choice()
+        if output_choice != KEEP_ORIGINAL_FORMAT:
+            output_format, _ = resolve_output_format(output_choice, Path("preview.jpg"))
+            return {output_format}
+        if not self.items:
+            return set()
+        return {
+            resolve_output_format(output_choice, item.path)[0]
+            for item in self.items
+        }
+
+    def _quality_controls_are_applicable(self) -> bool:
+        output_formats = self._compression_output_formats()
+        return not output_formats or bool(output_formats & {"JPG", "WEBP"})
+
     def _update_compression_format_hint(self) -> None:
         if not self.has_compression_controls:
             return
 
-        output_format: str | None = None
-        rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
-        if rows and 0 <= rows[0].row() < len(self.items):
-            output_format, _ = resolve_output_format(
-                self._get_output_choice(),
-                self.items[rows[0].row()].path,
-            )
-        elif self.has_format_controls:
-            output_format, _ = resolve_output_format(self._get_output_choice(), Path("preview.jpg"))
-
-        if output_format == "PNG":
+        output_formats = self._compression_output_formats()
+        if output_formats == {"PNG"}:
             text = "当前输出为 PNG：质量设置不生效，将使用无损编码。"
+        elif "PNG" in output_formats:
+            text = "批量任务包含 PNG：质量仅适用于 JPG/WEBP，PNG 将使用无损编码。"
         else:
             text = "质量设置仅适用于 JPG/WEBP；PNG 将使用无损编码。"
         self.compression_hint_label.setText(text)

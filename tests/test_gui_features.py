@@ -424,6 +424,69 @@ class GuiFeatureTestCase(unittest.TestCase):
             page.deleteLater()
             self.process_events()
 
+    def test_png_outputs_hide_quality_controls_without_losing_value(self) -> None:
+        comprehensive = ImageOperationPage(
+            "综合处理",
+            MODE_COMPREHENSIVE,
+            "pngQualityVisibilityComprehensiveTest",
+        )
+        compression = ImageOperationPage(
+            "图片压缩",
+            MODE_COMPRESS,
+            "pngQualityVisibilityCompressionTest",
+        )
+        try:
+            comprehensive.quality_slider.setValue(73)
+            comprehensive.output_format_combo.setCurrentText("PNG")
+            self.process_events()
+            self.assertTrue(comprehensive.quality_controls_container.isHidden())
+            self.assertFalse(comprehensive.quality_reset_button.isEnabled())
+            self.assertEqual(comprehensive._get_manual_quality(), 73)
+            self.assertIn("PNG", comprehensive.compression_hint_label.text())
+            self.assertIn("无损", comprehensive.compression_hint_label.text())
+
+            comprehensive.output_format_combo.setCurrentText("JPG")
+            self.process_events()
+            self.assertFalse(comprehensive.quality_controls_container.isHidden())
+            self.assertEqual(comprehensive.quality_spinbox.value(), 73)
+            self.assertTrue(comprehensive.quality_reset_button.isEnabled())
+
+            compression.quality_slider.setValue(73)
+            self.assertFalse(compression.quality_controls_container.isHidden())
+            compression.items = [
+                ImageListItem(Path("only.png"), "PNG", "100 × 100", "1KB")
+            ]
+            compression._update_compression_controls_state()
+            self.assertTrue(compression.quality_controls_container.isHidden())
+            self.assertFalse(compression.quality_reset_button.isEnabled())
+            self.assertEqual(compression._get_manual_quality(), 73)
+
+            compression.items.append(
+                ImageListItem(Path("also.jpg"), "JPG", "100 × 100", "1KB")
+            )
+            compression._update_compression_controls_state()
+            self.assertFalse(compression.quality_controls_container.isHidden())
+            self.assertEqual(compression.quality_spinbox.value(), 73)
+            self.assertTrue(compression.quality_reset_button.isEnabled())
+            self.assertIn("批量任务包含 PNG", compression.compression_hint_label.text())
+
+            compression.items.pop()
+            compression._update_compression_controls_state()
+            self.assertTrue(compression.quality_controls_container.isHidden())
+
+            compression.items.append(
+                ImageListItem(Path("fallback.bmp"), "BMP", "100 × 100", "1KB")
+            )
+            compression._update_compression_controls_state()
+            self.assertFalse(compression.quality_controls_container.isHidden())
+            self.assertTrue(compression.quality_reset_button.isEnabled())
+        finally:
+            for page in (comprehensive, compression):
+                page.shutdown()
+                page.close()
+                page.deleteLater()
+            self.process_events()
+
     def test_logo_grid_exact_width_boundaries_match_qt_layout(self) -> None:
         widget = AdaptiveLogoListWidget()
         try:
