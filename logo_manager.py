@@ -15,6 +15,20 @@ class LogoAsset:
     name: str
     path: Path
 
+    @property
+    def output_name(self) -> str:
+        """Return the LOGO name used in generated image filenames."""
+        return strip_logo_display_index(self.name)
+
+
+def strip_logo_display_index(name: str) -> str:
+    """Remove a leading two-digit display order from a LOGO asset name."""
+    if len(name) <= 2 or not name[:2].isdigit() or name[2].isdigit():
+        return name
+
+    output_name = name[2:].lstrip(" ._-")
+    return output_name or name
+
 
 def resource_path(relative_path: str) -> Path:
     base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))

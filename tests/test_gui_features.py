@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -20,15 +21,19 @@ from config import (
 )
 from gui import (
     AdaptiveLogoListWidget,
+    ImageListItem,
     ImageOperationPage,
     ImageToolWindow,
+    LOGO_RULE_CUSTOM,
     MODE_COMPRESS,
     MODE_COMPREHENSIVE,
     MODE_FORMAT,
     MODE_LOGO,
     MODE_RESIZE,
     MODE_WATERMARK,
+    PageSettings,
 )
+from logo_manager import LogoAsset
 
 
 class GuiFeatureTestCase(unittest.TestCase):
@@ -227,6 +232,65 @@ class GuiFeatureTestCase(unittest.TestCase):
             self.process_events()
             self.assertEqual(page.logo_list.height(), two_row_height)
             self.assertGreater(page.logo_list.verticalScrollBar().maximum(), 0)
+        finally:
+            page.shutdown()
+            page.close()
+            page.deleteLater()
+            self.process_events()
+
+    def test_logo_display_indexes_are_omitted_from_generated_filenames(self) -> None:
+        page = ImageOperationPage("LOGO", MODE_LOGO, "logoFilenameTest")
+        assets = [
+            LogoAsset(name="01生润食品", path=Path("01生润食品.png")),
+            LogoAsset(name="02冰润鲜", path=Path("02冰润鲜.png")),
+        ]
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                source = Path(temp_dir) / "原图.jpg"
+                page.items = [
+                    ImageListItem(
+                        path=source,
+                        image_format="JPG",
+                        dimensions="100 × 100",
+                        size_text="1KB",
+                        logo_rule=LOGO_RULE_CUSTOM,
+                        logo_assets=assets,
+                    )
+                ]
+
+                page.choose_save_radio.setChecked(True)
+                chosen_default_path: list[Path] = []
+
+                def choose_default_path(*args):
+                    default_path = Path(args[2])
+                    chosen_default_path.append(default_path)
+                    return str(default_path), ""
+
+                with patch(
+                    "gui.QFileDialog.getSaveFileName",
+                    side_effect=choose_default_path,
+                ):
+                    self.assertTrue(page._choose_save_location())
+
+                self.assertEqual(
+                    chosen_default_path[0].name,
+                    "原图_生润食品_冰润鲜.jpg",
+                )
+
+                page.original_save_radio.setChecked(True)
+                settings = PageSettings(
+                    output_size=None,
+                    output_choice="保持原格式",
+                    target_size=None,
+                    quality=None,
+                    apply_logo=True,
+                    logo_assets=assets,
+                    watermark_options=None,
+                )
+                tasks = page._prepare_tasks(settings)
+
+                self.assertEqual(tasks[0].output_path.name, "原图_生润食品_冰润鲜.jpg")
+                self.assertEqual([asset.name for asset in assets], ["01生润食品", "02冰润鲜"])
         finally:
             page.shutdown()
             page.close()

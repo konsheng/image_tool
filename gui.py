@@ -2250,7 +2250,7 @@ class ImageOperationPage(QWidget):
             source = self.items[0].path
             _, suffix = resolve_output_format(output_choice, source)
             apply_logo, logo_assets = self._effective_logo_for_item(self.items[0])
-            suffix_parts = [asset.name for asset in logo_assets] if apply_logo else None
+            suffix_parts = [asset.output_name for asset in logo_assets] if apply_logo else None
             default_path = source.with_name(f"{build_output_file_stem(source, suffix_parts)}{suffix}")
             selected, _ = QFileDialog.getSaveFileName(
                 self,
@@ -2408,7 +2408,7 @@ class ImageOperationPage(QWidget):
             else:
                 output_dir = Path(self.selected_save_path)
             apply_logo, logo_assets = self._effective_logo_for_item(item, settings.apply_logo, settings.logo_assets)
-            suffix_parts = [asset.name for asset in logo_assets] if apply_logo else None
+            suffix_parts = [asset.output_name for asset in logo_assets] if apply_logo else None
             output_path = build_default_output_path(
                 item.path,
                 output_dir,
