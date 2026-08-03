@@ -9,7 +9,7 @@ from unittest.mock import patch
 from PIL import Image
 
 import image_processor
-from config import MAX_OUTPUT_DIMENSION, MAX_OUTPUT_PIXELS
+from config import DEFAULT_MANUAL_QUALITY, MAX_OUTPUT_DIMENSION, MAX_OUTPUT_PIXELS
 from image_processor import (
     ProcessOptions,
     create_canvas,
@@ -25,7 +25,6 @@ def make_options(**overrides: object) -> ProcessOptions:
     values: dict[str, object] = {
         "output_format": "JPG",
         "output_size": None,
-        "target_size": None,
         "apply_logo": False,
         "logos": [],
         "watermark_options": None,
@@ -36,10 +35,6 @@ def make_options(**overrides: object) -> ProcessOptions:
 
 
 class ProcessOptionsTestCase(unittest.TestCase):
-    def test_target_size_and_quality_are_mutually_exclusive(self) -> None:
-        with self.assertRaises(ValueError):
-            make_options(target_size=100_000, quality=80)
-
     def test_quality_must_be_in_supported_range(self) -> None:
         for quality in (0, 101):
             with self.subTest(quality=quality):
@@ -121,6 +116,17 @@ class ImageCompositionTestCase(unittest.TestCase):
 
 
 class EncodedProcessingTestCase(unittest.TestCase):
+    def test_process_image_uses_default_quality(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.png"
+            target = root / "output.jpg"
+            make_detailed_image().save(source, format="PNG")
+
+            result = process_image(source, target, make_options())
+
+            self.assertEqual(result.compression.quality, DEFAULT_MANUAL_QUALITY)
+
     def test_process_image_uses_manual_quality(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

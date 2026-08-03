@@ -84,11 +84,7 @@ from config import (
     APP_AUTHOR,
     APP_NAME,
     APP_VERSION,
-    COMPRESSION_MODE_LABELS,
-    COMPRESSION_MODE_QUALITY,
-    COMPRESSION_MODE_TARGET,
     CUSTOM_SIZE_LABEL,
-    DEFAULT_COMPRESSION_MODE,
     DEFAULT_MANUAL_QUALITY,
     DEFAULT_WATERMARK_ANGLE,
     DEFAULT_WATERMARK_COLOR,
@@ -106,7 +102,6 @@ from config import (
     DEFAULT_WATERMARK_TILE_SPACING_Y,
     DEFAULT_OUTPUT_FORMAT,
     DEFAULT_OUTPUT_SIZE,
-    DEFAULT_TARGET_SIZE_LABEL,
     FEATURE_COMPRESS,
     FEATURE_COMPREHENSIVE,
     FEATURE_DEFAULTS,
@@ -127,13 +122,11 @@ from config import (
     PROJECT_RELEASES_URL,
     PROJECT_URL,
     STATUS_CANCELED,
-    STATUS_EXCEEDED,
     STATUS_FAILED,
     STATUS_PENDING,
     STATUS_PROCESSING,
     STATUS_SUCCESS,
     TABLE_HEADERS,
-    TARGET_SIZE_OPTIONS,
     WATERMARK_COLORS,
     WATERMARK_POSITION_CUSTOM,
     WATERMARK_POSITION_TILE,
@@ -543,7 +536,6 @@ def save_processing_statistics(
 class PageSettings:
     output_size: tuple[int, int] | None
     output_choice: str
-    target_size: int | None
     quality: int | None
     apply_logo: bool
     logo_assets: list[LogoAsset]
@@ -558,7 +550,6 @@ class PreviewRequest:
     source_size: int
     options: ProcessOptions
     logo_assets: list[LogoAsset]
-    compression_mode: str | None
 
 
 @dataclass(frozen=True)
@@ -568,7 +559,6 @@ class PreviewOutcome:
     file_name: str
     source_size: int
     watermark_options: WatermarkOptions | None
-    compression_mode: str | None
 
 
 class PreviewWorker(QObject):
@@ -587,13 +577,12 @@ class PreviewWorker(QObject):
             options = ProcessOptions(
                 output_format=request.options.output_format,
                 output_size=request.options.output_size,
-                target_size=request.options.target_size,
                 quality=request.options.quality,
                 apply_logo=request.options.apply_logo,
                 logos=logos,
                 watermark_options=request.options.watermark_options,
             )
-            if request.compression_mode is None:
+            if request.options.quality is None:
                 image = render_preview_image(request.source_path, options)
                 compression = None
             else:
@@ -609,7 +598,6 @@ class PreviewWorker(QObject):
                     file_name=request.file_name,
                     source_size=request.source_size,
                     watermark_options=request.options.watermark_options,
-                    compression_mode=request.compression_mode,
                 ),
             )
         except Exception as exc:
@@ -622,14 +610,13 @@ class ProcessingWorker(QObject):
     item_started = Signal(int, str)
     item_finished = Signal(int, str)
     output_committed = Signal(object)
-    progress_changed = Signal(int, int, str, int, int, int)
-    finished = Signal(int, int, int, int, object, bool)
+    progress_changed = Signal(int, int, str, int, int)
+    finished = Signal(int, int, int, object, bool)
 
     def __init__(
         self,
         tasks: list[ProcessingTask],
         output_size: tuple[int, int] | None,
-        target_size: int | None,
         quality: int | None,
         logo_cache: dict[str, Image.Image],
         watermark_options: WatermarkOptions | None,
@@ -637,7 +624,6 @@ class ProcessingWorker(QObject):
         super().__init__()
         self.tasks = tasks
         self.output_size = output_size
-        self.target_size = target_size
         self.quality = quality
         self.logo_cache = logo_cache
         self.watermark_options = watermark_options
@@ -650,7 +636,6 @@ class ProcessingWorker(QObject):
         total = len(self.tasks)
         success = 0
         failure = 0
-        warning = 0
         last_output_dir: Path | None = None
         canceled = False
 
@@ -673,7 +658,6 @@ class ProcessingWorker(QObject):
                     ProcessOptions(
                         output_format=task.output_format,
                         output_size=self.output_size,
-                        target_size=self.target_size,
                         quality=self.quality,
                         apply_logo=task.apply_logo,
                         logos=logo_copies,
@@ -691,12 +675,8 @@ class ProcessingWorker(QObject):
                         output_bytes=output_size,
                     )
                 )
-                if result.exceeded:
-                    warning += 1
-                    status = f"{STATUS_EXCEEDED}：最终 {bytes_to_display(result.output_size)}"
-                else:
-                    success += 1
-                    status = STATUS_SUCCESS
+                success += 1
+                status = STATUS_SUCCESS
             except Exception as exc:
                 failure += 1
                 reason = str(exc) or "图片无法打开"
@@ -711,7 +691,7 @@ class ProcessingWorker(QObject):
                 status = f"{STATUS_FAILED}：{reason}"
 
             self.item_finished.emit(task.row, status)
-            self.progress_changed.emit(current, total, file_name, success, failure, warning)
+            self.progress_changed.emit(current, total, file_name, success, failure)
 
             if self.cancel_requested:
                 canceled = True
@@ -719,7 +699,7 @@ class ProcessingWorker(QObject):
                     self.item_finished.emit(remaining_task.row, STATUS_CANCELED)
                 break
 
-        self.finished.emit(total, success, failure, warning, last_output_dir, canceled)
+        self.finished.emit(total, success, failure, last_output_dir, canceled)
 
 
 class ImageOperationPage(QWidget):
@@ -761,9 +741,9 @@ class ImageOperationPage(QWidget):
         self._connect_signals()
         self._update_save_mode()
         self._update_custom_size_state()
-        self._update_custom_compression_state()
+        self._update_compression_controls_state()
         self._update_watermark_controls_state()
-        self._update_result_labels(0, 0, 0, 0)
+        self._update_result_labels(0, 0, 0)
 
     @property
     def has_size_controls(self) -> bool:
@@ -831,7 +811,7 @@ class ImageOperationPage(QWidget):
         elif feature == MODE_RESIZE:
             self._update_custom_size_state()
         elif feature == MODE_COMPRESS:
-            self._update_custom_compression_state()
+            self._update_compression_controls_state()
         elif feature == MODE_WATERMARK:
             self._update_watermark_controls_state()
         self._refresh_preview()
@@ -1018,12 +998,10 @@ class ImageOperationPage(QWidget):
         self.total_label = QLabel(self)
         self.success_label = QLabel(self)
         self.failure_label = QLabel(self)
-        self.warning_label = QLabel(self)
         result_grid.addWidget(self.total_label, 0, 0)
         result_grid.addWidget(self.success_label, 0, 1)
         result_grid.addWidget(self.failure_label, 0, 2)
-        result_grid.addWidget(self.warning_label, 0, 3)
-        result_grid.addItem(QSpacerItem(1, 1, QSizePolicy.Expanding, QSizePolicy.Minimum), 0, 4)
+        result_grid.addItem(QSpacerItem(1, 1, QSizePolicy.Expanding, QSizePolicy.Minimum), 0, 3)
         result_layout.addLayout(result_grid)
         layout.addWidget(result_card)
         layout.addStretch(1)
@@ -1107,20 +1085,22 @@ class ImageOperationPage(QWidget):
             size_row.addStretch(1)
             size_layout.addLayout(size_row)
 
-            custom_row = QHBoxLayout()
-            self.custom_width_edit = LineEdit(self)
+            self.custom_size_container = QWidget(card)
+            custom_row = QHBoxLayout(self.custom_size_container)
+            custom_row.setContentsMargins(0, 0, 0, 0)
+            self.custom_width_edit = LineEdit(self.custom_size_container)
             self.custom_width_edit.setPlaceholderText("宽")
             self.custom_width_edit.setFixedWidth(76)
-            self.custom_height_edit = LineEdit(self)
+            self.custom_height_edit = LineEdit(self.custom_size_container)
             self.custom_height_edit.setPlaceholderText("高")
             self.custom_height_edit.setFixedWidth(76)
-            custom_row.addWidget(QLabel(CUSTOM_SIZE_LABEL, self))
+            custom_row.addWidget(QLabel(CUSTOM_SIZE_LABEL, self.custom_size_container))
             custom_row.addWidget(self.custom_width_edit)
-            custom_row.addWidget(QLabel("×", self))
+            custom_row.addWidget(QLabel("×", self.custom_size_container))
             custom_row.addWidget(self.custom_height_edit)
-            custom_row.addWidget(QLabel("px", self))
+            custom_row.addWidget(QLabel("px", self.custom_size_container))
             custom_row.addStretch(1)
-            size_layout.addLayout(custom_row)
+            size_layout.addWidget(self.custom_size_container)
         else:
             self._add_readonly_row(layout, "输出尺寸", "保持原尺寸")
 
@@ -1140,55 +1120,6 @@ class ImageOperationPage(QWidget):
 
         if self.has_compression_controls:
             compression_layout = self._feature_section_layout(card, layout, MODE_COMPRESS)
-            mode_row = QHBoxLayout()
-            mode_row.addWidget(QLabel("压缩模式", self))
-            self.compression_mode_group = QButtonGroup(self)
-            self.target_mode_radio = RadioButton(self)
-            self.target_mode_radio.setText(COMPRESSION_MODE_LABELS[COMPRESSION_MODE_TARGET])
-            self.quality_mode_radio = RadioButton(self)
-            self.quality_mode_radio.setText(COMPRESSION_MODE_LABELS[COMPRESSION_MODE_QUALITY])
-            self.compression_mode_group.addButton(self.target_mode_radio)
-            self.compression_mode_group.addButton(self.quality_mode_radio)
-            mode_row.addWidget(self.target_mode_radio)
-            mode_row.addWidget(self.quality_mode_radio)
-            mode_row.addStretch(1)
-            compression_layout.addLayout(mode_row)
-
-            if DEFAULT_COMPRESSION_MODE == COMPRESSION_MODE_QUALITY:
-                self.quality_mode_radio.setChecked(True)
-            else:
-                self.target_mode_radio.setChecked(True)
-
-            self.target_size_label = QLabel("目标大小", self)
-            compression_layout.addWidget(self.target_size_label)
-            self.size_group = QButtonGroup(self)
-            self.size_radios: dict[str, RadioButton] = {}
-            size_grid = QGridLayout()
-            size_grid.setHorizontalSpacing(16)
-            size_grid.setVerticalSpacing(8)
-            for index, label in enumerate(TARGET_SIZE_OPTIONS):
-                radio = RadioButton(self)
-                radio.setText(label)
-                self.size_group.addButton(radio)
-                self.size_radios[label] = radio
-                size_grid.addWidget(radio, index // 2, index % 2)
-
-            self.custom_size_radio = RadioButton(self)
-            self.custom_size_radio.setText(CUSTOM_SIZE_LABEL)
-            self.size_group.addButton(self.custom_size_radio)
-            custom_row = QHBoxLayout()
-            custom_row.addWidget(self.custom_size_radio)
-            self.custom_size_edit = LineEdit(self)
-            self.custom_size_edit.setPlaceholderText("MB")
-            self.custom_size_edit.setFixedWidth(96)
-            self.custom_size_edit.setEnabled(False)
-            custom_row.addWidget(self.custom_size_edit)
-            custom_row.addStretch(1)
-            size_grid.addLayout(custom_row, 1, 1)
-
-            self.size_radios[DEFAULT_TARGET_SIZE_LABEL].setChecked(True)
-            compression_layout.addLayout(size_grid)
-
             quality_row = QHBoxLayout()
             self.quality_label = QLabel("压缩质量", self)
             self.quality_slider = Slider(self)
@@ -1200,9 +1131,18 @@ class ImageOperationPage(QWidget):
             self.quality_spinbox.setRange(MIN_MANUAL_QUALITY, MAX_MANUAL_QUALITY)
             self.quality_spinbox.setValue(DEFAULT_MANUAL_QUALITY)
             self.quality_spinbox.setFixedWidth(160)
+            self.quality_reset_button = self._create_button(
+                PushButton,
+                "重置为默认值",
+                FIF.RETURN,
+            )
+            self.quality_reset_button.setToolTip(
+                f"将压缩质量恢复为 {DEFAULT_MANUAL_QUALITY}"
+            )
             quality_row.addWidget(self.quality_label)
             quality_row.addWidget(self.quality_slider, 1)
             quality_row.addWidget(self.quality_spinbox)
+            quality_row.addWidget(self.quality_reset_button)
             quality_row.addStretch(1)
             compression_layout.addLayout(quality_row)
 
@@ -1493,13 +1433,9 @@ class ImageOperationPage(QWidget):
             self.output_format_combo.currentTextChanged.connect(self._reset_save_location)
             self.output_format_combo.currentTextChanged.connect(self._refresh_preview)
         if self.has_compression_controls:
-            self.compression_mode_group.buttonClicked.connect(self._update_custom_compression_state)
-            self.compression_mode_group.buttonClicked.connect(self._refresh_preview)
-            self.size_group.buttonClicked.connect(self._update_custom_compression_state)
-            self.size_group.buttonClicked.connect(self._refresh_preview)
-            self.custom_size_edit.textChanged.connect(self._refresh_preview)
             self.quality_slider.valueChanged.connect(self._on_quality_slider_changed)
             self.quality_spinbox.valueChanged.connect(self._on_quality_spinbox_changed)
+            self.quality_reset_button.clicked.connect(self._reset_quality_to_default)
         if self.has_optional_logo:
             self.logo_checkbox.stateChanged.connect(self._update_logo_grid_state)
             self.logo_checkbox.stateChanged.connect(self._refresh_preview)
@@ -1852,19 +1788,14 @@ class ImageOperationPage(QWidget):
             self._set_preview_message("请输入正确的输出尺寸")
             return
 
-        compression_mode = self._get_compression_mode()
-        target_size: int | None = None
-        quality: int | None = None
-        if compression_mode == COMPRESSION_MODE_TARGET:
-            target_size = self._get_target_size()
-            if target_size is None:
-                self._set_preview_message("请输入正确的压缩大小")
-                return
-        elif compression_mode == COMPRESSION_MODE_QUALITY:
-            quality = self._get_manual_quality()
-            if quality is None:
-                self._set_preview_message("请输入正确的压缩质量")
-                return
+        quality = self._get_manual_quality()
+        if (
+            self.has_compression_controls
+            and self.is_feature_enabled(MODE_COMPRESS)
+            and quality is None
+        ):
+            self._set_preview_message("请输入正确的压缩质量")
+            return
 
         apply_logo, logo_assets = self._effective_logo_for_item(self.items[row])
         if apply_logo and not logo_assets:
@@ -1888,14 +1819,12 @@ class ImageOperationPage(QWidget):
                 options=ProcessOptions(
                     output_format=output_format,
                     output_size=output_size,
-                    target_size=target_size,
                     quality=quality,
                     apply_logo=apply_logo,
                     logos=[],
                     watermark_options=watermark_options,
                 ),
                 logo_assets=list(logo_assets),
-                compression_mode=compression_mode,
             )
         except Exception as exc:
             self._set_preview_message(self._preview_error_message(str(exc)))
@@ -1941,7 +1870,6 @@ class ImageOperationPage(QWidget):
             outcome.watermark_options,
             outcome.compression,
             outcome.source_size,
-            outcome.compression_mode,
         )
 
     def _on_preview_failed(self, request_id: int, reason: str) -> None:
@@ -1988,7 +1916,6 @@ class ImageOperationPage(QWidget):
         watermark_options: WatermarkOptions | None,
         compression: object | None = None,
         source_size: int | None = None,
-        compression_mode: str | None = None,
     ) -> None:
         preview = image.copy()
         max_width = max(220, self.preview_image_label.width() - 24)
@@ -2022,17 +1949,9 @@ class ImageOperationPage(QWidget):
 
             actual_quality = getattr(compression, "quality", None)
             if isinstance(actual_quality, int):
-                quality_label = "自动质量" if compression_mode == COMPRESSION_MODE_TARGET else "实际质量"
-                detail_parts.append(f"{quality_label}：{actual_quality}")
+                detail_parts.append(f"实际质量：{actual_quality}")
             else:
-                detail = str(getattr(compression, "detail", ""))
-                if detail.startswith("palette="):
-                    detail_parts.append(f"编码：PNG 减色（{detail.removeprefix('palette=')} 色）")
-                else:
-                    detail_parts.append("编码：PNG 无损")
-
-            if bool(getattr(compression, "exceeded", False)):
-                detail_parts.append("超出目标大小")
+                detail_parts.append("编码：PNG 无损")
             lines.append("    ".join(detail_parts))
         self.preview_info_label.setText("\n".join(lines))
 
@@ -2144,7 +2063,7 @@ class ImageOperationPage(QWidget):
         self.items.clear()
         self.table.setRowCount(0)
         self._reset_save_location()
-        self._update_result_labels(0, 0, 0, 0)
+        self._update_result_labels(0, 0, 0)
         self.progress_bar.setValue(0)
         self.progress_text.setText("总数：0    当前：0/0    文件：-")
         self._refresh_preview()
@@ -2152,50 +2071,58 @@ class ImageOperationPage(QWidget):
     def _update_custom_size_state(self, *_args) -> None:
         if not self.has_size_controls:
             return
+        custom_selected = self.size_combo.currentText() == CUSTOM_SIZE_LABEL
+        was_hidden = self.custom_size_container.isHidden()
+        self.custom_size_container.setVisible(custom_selected)
         enabled = (
-            self.size_combo.currentText() == CUSTOM_SIZE_LABEL
+            custom_selected
             and self.is_feature_enabled(MODE_RESIZE)
             and not self.processing_active
         )
         self.custom_width_edit.setEnabled(enabled)
         self.custom_height_edit.setEnabled(enabled)
-        if enabled:
+        if enabled and was_hidden:
             self.custom_width_edit.setFocus()
 
-    def _update_custom_compression_state(self, *_args) -> None:
+    def _update_compression_controls_state(self, *_args) -> None:
         if not self.has_compression_controls:
             return
 
-        processing = self.processing_active
-        target_mode = self.target_mode_radio.isChecked()
-        target_enabled = target_mode and not processing
-        quality_enabled = (not target_mode) and not processing
-
-        for button in self.compression_mode_group.buttons():
-            button.setEnabled(not processing)
-        self.target_size_label.setEnabled(target_enabled)
-        for button in self.size_group.buttons():
-            button.setEnabled(target_enabled)
-        self.custom_size_edit.setEnabled(target_enabled and self.custom_size_radio.isChecked())
+        quality_enabled = (
+            self.is_feature_enabled(MODE_COMPRESS)
+            and not self.processing_active
+        )
         self.quality_label.setEnabled(quality_enabled)
         self.quality_slider.setEnabled(quality_enabled)
         self.quality_spinbox.setEnabled(quality_enabled)
+        self._update_quality_reset_button_state()
         self._update_compression_format_hint()
 
-        if target_enabled and self.custom_size_radio.isChecked():
-            self.custom_size_edit.setFocus()
-
     def _on_quality_slider_changed(self, value: int) -> None:
+        self._update_quality_reset_button_state()
         if self.quality_spinbox.value() != value:
             self.quality_spinbox.setValue(value)
             return
         self._refresh_preview()
 
     def _on_quality_spinbox_changed(self, value: int) -> None:
+        self._update_quality_reset_button_state()
         if self.quality_slider.value() != value:
             self.quality_slider.setValue(value)
             return
         self._refresh_preview()
+
+    def _reset_quality_to_default(self, *_args) -> None:
+        self.quality_slider.setValue(DEFAULT_MANUAL_QUALITY)
+        self._update_quality_reset_button_state()
+
+    def _update_quality_reset_button_state(self) -> None:
+        enabled = (
+            self.is_feature_enabled(MODE_COMPRESS)
+            and not self.processing_active
+            and self.quality_spinbox.value() != DEFAULT_MANUAL_QUALITY
+        )
+        self.quality_reset_button.setEnabled(enabled)
 
     def _update_compression_format_hint(self) -> None:
         if not self.has_compression_controls:
@@ -2211,12 +2138,7 @@ class ImageOperationPage(QWidget):
         elif self.has_format_controls:
             output_format, _ = resolve_output_format(self._get_output_choice(), Path("preview.jpg"))
 
-        compression_mode = self._get_compression_mode()
-        if compression_mode == COMPRESSION_MODE_TARGET and output_format == "PNG":
-            text = "当前输出为 PNG：先无损压缩，超出目标时会尝试减少颜色。"
-        elif compression_mode == COMPRESSION_MODE_TARGET:
-            text = "按目标大小会优先搜索较高的 JPG/WEBP 质量。"
-        elif output_format == "PNG":
+        if output_format == "PNG":
             text = "当前输出为 PNG：质量设置不生效，将使用无损编码。"
         else:
             text = "质量设置仅适用于 JPG/WEBP；PNG 将使用无损编码。"
@@ -2291,7 +2213,7 @@ class ImageOperationPage(QWidget):
             self._set_row_status(row, STATUS_PENDING)
 
         self._set_processing_state(True)
-        self._update_result_labels(len(tasks), 0, 0, 0)
+        self._update_result_labels(len(tasks), 0, 0)
         self.progress_bar.setValue(0)
         self.progress_text.setText(f"总数：{len(tasks)}    当前：0/{len(tasks)}    文件：-")
         self.last_output_location = None
@@ -2301,7 +2223,6 @@ class ImageOperationPage(QWidget):
         self.worker = ProcessingWorker(
             tasks=tasks,
             output_size=settings.output_size,
-            target_size=settings.target_size,
             quality=settings.quality,
             logo_cache=logo_cache,
             watermark_options=settings.watermark_options,
@@ -2339,13 +2260,12 @@ class ImageOperationPage(QWidget):
             self._show_message("warning", "请输入正确的输出尺寸")
             return None
 
-        compression_mode = self._get_compression_mode()
-        target_size = self._get_target_size()
         quality = self._get_manual_quality()
-        if compression_mode == COMPRESSION_MODE_TARGET and target_size is None:
-            self._show_message("warning", "请输入正确的压缩大小")
-            return None
-        if compression_mode == COMPRESSION_MODE_QUALITY and quality is None:
+        if (
+            self.has_compression_controls
+            and self.is_feature_enabled(MODE_COMPRESS)
+            and quality is None
+        ):
             self._show_message("warning", "请输入正确的压缩质量")
             return None
 
@@ -2367,7 +2287,6 @@ class ImageOperationPage(QWidget):
         return PageSettings(
             output_size=output_size,
             output_choice=self._get_output_choice(),
-            target_size=target_size,
             quality=quality,
             apply_logo=self._get_apply_logo(),
             logo_assets=logo_assets,
@@ -2456,46 +2375,10 @@ class ImageOperationPage(QWidget):
             return None
         return width, height
 
-    def _get_target_size(self) -> int | None:
-        if (
-            not self.has_compression_controls
-            or not self.is_feature_enabled(MODE_COMPRESS)
-            or self._get_compression_mode() != COMPRESSION_MODE_TARGET
-        ):
-            return None
-
-        for label, bytes_value in TARGET_SIZE_OPTIONS.items():
-            if self.size_radios[label].isChecked():
-                return bytes_value
-
-        if self.custom_size_radio.isChecked():
-            text = self.custom_size_edit.text().strip()
-            try:
-                value = float(text)
-                size_bytes = int(value * 1_000_000)
-            except (ValueError, OverflowError):
-                return None
-            if value <= 0 or size_bytes <= 0:
-                return None
-            return size_bytes
-
-        return None
-
-    def _get_compression_mode(self) -> str | None:
-        if (
-            not self.has_compression_controls
-            or not self.is_feature_enabled(MODE_COMPRESS)
-        ):
-            return None
-        if self.quality_mode_radio.isChecked():
-            return COMPRESSION_MODE_QUALITY
-        return COMPRESSION_MODE_TARGET
-
     def _get_manual_quality(self) -> int | None:
         if (
             not self.has_compression_controls
             or not self.is_feature_enabled(MODE_COMPRESS)
-            or self._get_compression_mode() != COMPRESSION_MODE_QUALITY
         ):
             return None
         value = self.quality_spinbox.value()
@@ -2728,9 +2611,7 @@ class ImageOperationPage(QWidget):
 
         if self.has_size_controls:
             self.size_combo.setEnabled(not processing)
-            custom_enabled = not processing and self.size_combo.currentText() == CUSTOM_SIZE_LABEL
-            self.custom_width_edit.setEnabled(custom_enabled)
-            self.custom_height_edit.setEnabled(custom_enabled)
+            self._update_custom_size_state()
         if self.has_format_controls:
             self.output_format_combo.setEnabled(not processing)
         if self.has_optional_logo:
@@ -2741,7 +2622,7 @@ class ImageOperationPage(QWidget):
             self.logo_disable_selected_button.setEnabled(not processing)
             self.logo_restore_default_button.setEnabled(not processing)
         if self.has_compression_controls:
-            self._update_custom_compression_state()
+            self._update_compression_controls_state()
         if self.has_optional_watermark or self.always_apply_watermark:
             self._update_watermark_controls_state()
         for button in self.save_group.buttons():
@@ -2764,23 +2645,21 @@ class ImageOperationPage(QWidget):
         file_name: str,
         success: int,
         failure: int,
-        warning: int,
     ) -> None:
         value = int(current / total * 100) if total else 0
         self.progress_bar.setValue(value)
         self.progress_text.setText(f"总数：{total}    当前：{current}/{total}    文件：{file_name}")
-        self._update_result_labels(total, success, failure, warning)
+        self._update_result_labels(total, success, failure)
 
     def _on_processing_finished(
         self,
         total: int,
         success: int,
         failure: int,
-        warning: int,
         last_output_dir: object,
         canceled: bool,
     ) -> None:
-        self._update_result_labels(total, success, failure, warning)
+        self._update_result_labels(total, success, failure)
         if not canceled:
             self.progress_bar.setValue(100 if total else 0)
         self.last_output_location = last_output_dir if isinstance(last_output_dir, Path) else None
@@ -2829,11 +2708,10 @@ class ImageOperationPage(QWidget):
         if item is not None:
             item.setText(status)
 
-    def _update_result_labels(self, total: int, success: int, failure: int, warning: int) -> None:
+    def _update_result_labels(self, total: int, success: int, failure: int) -> None:
         self.total_label.setText(f"总数：{total}")
         self.success_label.setText(f"成功：{success}")
         self.failure_label.setText(f"失败：{failure}")
-        self.warning_label.setText(f"警告：{warning}")
 
     def _open_last_location(self, *_args) -> None:
         if self.last_output_location is None:

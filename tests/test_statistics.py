@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QAbstractButton, QApplication
 
-from config import STATUS_CANCELED, STATUS_EXCEEDED, STATUS_FAILED, STATUS_SUCCESS
+from config import STATUS_CANCELED, STATUS_FAILED, STATUS_SUCCESS
 from gui import (
     ImageOperationPage,
     ImageToolWindow,
@@ -196,7 +196,7 @@ class StatisticsTestCase(unittest.TestCase):
             finally:
                 self.close_window(window)
 
-    def test_worker_reports_actual_sizes_for_success_and_exceeded_only(self) -> None:
+    def test_worker_reports_actual_sizes_for_successful_outputs_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             source_sizes = [11, 22, 33, 44]
@@ -218,8 +218,7 @@ class StatisticsTestCase(unittest.TestCase):
             worker = ProcessingWorker(
                 tasks=tasks,
                 output_size=None,
-                target_size=None,
-                quality=100,
+                quality=95,
                 logo_cache={},
                 watermark_options=None,
             )
@@ -244,14 +243,12 @@ class StatisticsTestCase(unittest.TestCase):
                     return SimpleNamespace(
                         output_path=output_path,
                         output_size=999,
-                        exceeded=False,
                     )
                 if row == 1:
                     output_path.write_bytes(b"b" * 30)
                     return SimpleNamespace(
                         output_path=output_path,
                         output_size=888,
-                        exceeded=True,
                     )
                 if row == 2:
                     output_path.write_bytes(b"partial")
@@ -267,14 +264,13 @@ class StatisticsTestCase(unittest.TestCase):
                 [ProcessedOutput(11, 4), ProcessedOutput(22, 30)],
             )
             self.assertEqual(statuses[0], (0, STATUS_SUCCESS))
-            self.assertEqual(statuses[1][0], 1)
-            self.assertTrue(statuses[1][1].startswith(STATUS_EXCEEDED))
+            self.assertEqual(statuses[1], (1, STATUS_SUCCESS))
             self.assertEqual(statuses[2][0], 2)
             self.assertTrue(statuses[2][1].startswith(STATUS_FAILED))
             self.assertEqual(statuses[3], (3, STATUS_CANCELED))
             self.assertEqual(len(finished), 1)
-            total, success, failure, warning, _last_output_dir, canceled = finished[0]
-            self.assertEqual((total, success, failure, warning, canceled), (4, 1, 1, 1, True))
+            total, success, failure, _last_output_dir, canceled = finished[0]
+            self.assertEqual((total, success, failure, canceled), (4, 2, 1, True))
 
 
 if __name__ == "__main__":

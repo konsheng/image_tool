@@ -15,6 +15,7 @@ from qfluentwidgets import qrouter
 
 from config import (
     CUSTOM_SIZE_LABEL,
+    DEFAULT_MANUAL_QUALITY,
     FEATURE_DEFAULTS,
     MAX_OUTPUT_DIMENSION,
     MAX_OUTPUT_PIXELS,
@@ -64,10 +65,11 @@ class GuiFeatureTestCase(unittest.TestCase):
             try:
                 self.assertEqual(window.feature_states, FEATURE_DEFAULTS)
                 for page in (window.comprehensive_page, window.compress_page):
-                    self.assertTrue(page.quality_mode_radio.isChecked())
-                    self.assertEqual(page.quality_slider.value(), 100)
-                    self.assertEqual(page.quality_spinbox.value(), 100)
-                    self.assertEqual(page.quality_spinbox.text(), "100")
+                    self.assertFalse(hasattr(page, "warning_label"))
+                    self.assertEqual(page.quality_slider.value(), DEFAULT_MANUAL_QUALITY)
+                    self.assertEqual(page.quality_spinbox.value(), DEFAULT_MANUAL_QUALITY)
+                    self.assertEqual(page.quality_spinbox.text(), str(DEFAULT_MANUAL_QUALITY))
+                    self.assertFalse(page.quality_reset_button.isEnabled())
                 self.assertTrue(window.feature_nav_items[MODE_WATERMARK].isHidden())
                 self.assertTrue(
                     window.comprehensive_page.feature_sections[MODE_WATERMARK].isHidden()
@@ -108,7 +110,7 @@ class GuiFeatureTestCase(unittest.TestCase):
                 self.assertFalse(page.feature_sections[MODE_WATERMARK].isHidden())
                 self.assertIsNone(page._get_output_size())
                 self.assertEqual(page._get_output_choice(), "保持原格式")
-                self.assertIsNone(page._get_compression_mode())
+                self.assertIsNone(page._get_manual_quality())
                 self.assertFalse(page._get_apply_logo())
                 self.assertTrue(page.output_card.isHidden())
                 self.assertTrue(page.feature_sections[MODE_LOGO].isHidden())
@@ -281,7 +283,6 @@ class GuiFeatureTestCase(unittest.TestCase):
                 settings = PageSettings(
                     output_size=None,
                     output_choice="保持原格式",
-                    target_size=None,
                     quality=None,
                     apply_logo=True,
                     logo_assets=assets,
@@ -300,28 +301,37 @@ class GuiFeatureTestCase(unittest.TestCase):
     def test_feature_controls_resync_after_processing_cycle(self) -> None:
         page = ImageOperationPage("综合处理", MODE_COMPREHENSIVE, "featureStateCycleTest")
         try:
-            page.target_mode_radio.setChecked(True)
             page.watermark_checkbox.setChecked(True)
-            page._update_custom_compression_state()
+            page._update_compression_controls_state()
             page._update_watermark_controls_state()
-            self.assertTrue(page.target_size_label.isEnabled())
-            self.assertFalse(page.quality_slider.isEnabled())
+            self.assertTrue(page.quality_slider.isEnabled())
             self.assertTrue(page.watermark_type_combo.isEnabled())
+
+            page.quality_slider.setValue(73)
+            self.process_events()
+            self.assertTrue(page.quality_reset_button.isEnabled())
 
             page.set_feature_enabled(MODE_COMPRESS, False)
             page.set_feature_enabled(MODE_WATERMARK, False)
+            self.assertFalse(page.quality_slider.isEnabled())
+            self.assertFalse(page.quality_spinbox.isEnabled())
+            self.assertFalse(page.quality_reset_button.isEnabled())
             page._set_processing_state(True)
             page._set_processing_state(False)
             page.set_feature_enabled(MODE_COMPRESS, True)
             page.set_feature_enabled(MODE_WATERMARK, True)
 
-            self.assertTrue(page.target_mode_radio.isChecked())
-            self.assertTrue(page.target_size_label.isEnabled())
-            self.assertTrue(page.custom_size_radio.isEnabled())
-            self.assertFalse(page.quality_slider.isEnabled())
+            self.assertTrue(page.quality_slider.isEnabled())
+            self.assertTrue(page.quality_spinbox.isEnabled())
+            self.assertTrue(page.quality_reset_button.isEnabled())
             self.assertTrue(page.watermark_checkbox.isChecked())
             self.assertTrue(page.watermark_type_combo.isEnabled())
             self.assertTrue(page.watermark_text_edit.isEnabled())
+
+            page._set_processing_state(True)
+            self.assertFalse(page.quality_reset_button.isEnabled())
+            page._set_processing_state(False)
+            self.assertTrue(page.quality_reset_button.isEnabled())
         finally:
             page.shutdown()
             page.close()
@@ -331,7 +341,14 @@ class GuiFeatureTestCase(unittest.TestCase):
     def test_custom_output_size_is_bounded_before_processing(self) -> None:
         page = ImageOperationPage("尺寸处理", MODE_RESIZE, "boundedOutputSizeTest")
         try:
+            self.assertTrue(page.custom_size_container.isHidden())
+
             page.size_combo.setCurrentText(CUSTOM_SIZE_LABEL)
+            self.process_events()
+            self.assertFalse(page.custom_size_container.isHidden())
+            self.assertTrue(page.custom_width_edit.isEnabled())
+            self.assertTrue(page.custom_height_edit.isEnabled())
+
             page.custom_width_edit.setText(str(MAX_OUTPUT_DIMENSION + 1))
             page.custom_height_edit.setText("1")
             self.assertIsNone(page._get_output_size())
@@ -345,6 +362,26 @@ class GuiFeatureTestCase(unittest.TestCase):
             page.custom_width_edit.setText("8000")
             page.custom_height_edit.setText("4000")
             self.assertEqual(page._get_output_size(), (8000, 4000))
+
+            page.size_combo.setCurrentIndex(0)
+            self.process_events()
+            self.assertTrue(page.custom_size_container.isHidden())
+
+            page.size_combo.setCurrentText(CUSTOM_SIZE_LABEL)
+            self.process_events()
+            self.assertFalse(page.custom_size_container.isHidden())
+            self.assertEqual(page.custom_width_edit.text(), "8000")
+            self.assertEqual(page.custom_height_edit.text(), "4000")
+
+            page._set_processing_state(True)
+            self.assertFalse(page.custom_size_container.isHidden())
+            self.assertFalse(page.custom_width_edit.isEnabled())
+            self.assertFalse(page.custom_height_edit.isEnabled())
+
+            page._set_processing_state(False)
+            self.assertFalse(page.custom_size_container.isHidden())
+            self.assertTrue(page.custom_width_edit.isEnabled())
+            self.assertTrue(page.custom_height_edit.isEnabled())
         finally:
             page.shutdown()
             page.close()
@@ -358,15 +395,23 @@ class GuiFeatureTestCase(unittest.TestCase):
             self.process_events()
             self.assertEqual(page.quality_spinbox.value(), 73)
             self.assertEqual(page.quality_spinbox.text(), "73")
+            self.assertTrue(page.quality_reset_button.isEnabled())
             self.assertGreaterEqual(
                 page.quality_spinbox.width(),
                 page.quality_spinbox.minimumSizeHint().width(),
             )
 
+            page.quality_reset_button.click()
+            self.process_events()
+            self.assertEqual(page.quality_slider.value(), DEFAULT_MANUAL_QUALITY)
+            self.assertEqual(page.quality_spinbox.value(), DEFAULT_MANUAL_QUALITY)
+            self.assertFalse(page.quality_reset_button.isEnabled())
+
             page.quality_spinbox.setValue(41)
             self.process_events()
             self.assertEqual(page.quality_slider.value(), 41)
             self.assertEqual(page.quality_spinbox.text(), "41")
+            self.assertTrue(page.quality_reset_button.isEnabled())
             expected_handle_x = int(
                 (41 - page.quality_slider.minimum())
                 / (page.quality_slider.maximum() - page.quality_slider.minimum())

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
-from compressor import CompressionResult, compress_image_to_bytes, save_image_to_bytes
+from compressor import CompressionResult, save_image_to_bytes
 from config import (
     MAX_OUTPUT_DIMENSION,
     MAX_OUTPUT_PIXELS,
@@ -54,7 +54,6 @@ class WatermarkOptions:
 class ProcessOptions:
     output_format: str
     output_size: tuple[int, int] | None
-    target_size: int | None
     apply_logo: bool
     logos: list[Image.Image]
     watermark_options: WatermarkOptions | None = None
@@ -63,8 +62,6 @@ class ProcessOptions:
     def __post_init__(self) -> None:
         if self.output_size is not None:
             _validate_output_size(self.output_size)
-        if self.target_size is not None and self.quality is not None:
-            raise ValueError("target_size and quality are mutually exclusive")
         if self.quality is not None:
             if isinstance(self.quality, bool) or not isinstance(self.quality, int):
                 raise ValueError("quality must be an integer")
@@ -78,7 +75,6 @@ class ProcessOptions:
 class ProcessResult:
     output_path: Path
     output_size: int
-    exceeded: bool
     compression: CompressionResult
     dimensions: tuple[int, int]
 
@@ -114,7 +110,6 @@ def process_image(source_path: str | Path, output_path: str | Path, options: Pro
     return ProcessResult(
         output_path=target,
         output_size=compression.size,
-        exceeded=compression.exceeded,
         compression=compression,
         dimensions=working.size,
     )
@@ -163,8 +158,6 @@ def _render_working_image(source_path: str | Path, options: ProcessOptions) -> I
 
 
 def _encode_working_image(image: Image.Image, options: ProcessOptions) -> CompressionResult:
-    if options.target_size is not None:
-        return compress_image_to_bytes(image, options.output_format, options.target_size)
     return save_image_to_bytes(image, options.output_format, quality=options.quality)
 
 
