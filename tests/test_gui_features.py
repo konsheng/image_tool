@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication, QListView, QListWidgetItem
 from qfluentwidgets import qrouter
 
 from config import (
+    COMPREHENSIVE_FEATURE_DEFAULTS,
     CUSTOM_SIZE_LABEL,
     DEFAULT_MANUAL_QUALITY,
     FEATURE_DEFAULTS,
@@ -22,6 +23,7 @@ from config import (
 )
 from gui import (
     AdaptiveLogoListWidget,
+    COMPREHENSIVE_FEATURES,
     ImageListItem,
     ImageOperationPage,
     ImageToolWindow,
@@ -33,6 +35,8 @@ from gui import (
     MODE_RESIZE,
     MODE_WATERMARK,
     PageSettings,
+    comprehensive_feature_setting_key,
+    feature_setting_key,
 )
 from logo_manager import LogoAsset
 
@@ -59,28 +63,42 @@ class GuiFeatureTestCase(unittest.TestCase):
         window.deleteLater()
         self.process_events()
 
-    def test_feature_defaults_and_global_watermark_gate(self) -> None:
+    def test_page_and_comprehensive_feature_defaults_are_separate(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             window, _ = self.make_window(Path(temp_dir) / "settings.ini")
             try:
                 self.assertEqual(window.feature_states, FEATURE_DEFAULTS)
+                self.assertEqual(
+                    window.comprehensive_feature_states,
+                    COMPREHENSIVE_FEATURE_DEFAULTS,
+                )
                 for page in (window.comprehensive_page, window.compress_page):
                     self.assertFalse(hasattr(page, "warning_label"))
                     self.assertEqual(page.quality_slider.value(), DEFAULT_MANUAL_QUALITY)
                     self.assertEqual(page.quality_spinbox.value(), DEFAULT_MANUAL_QUALITY)
                     self.assertEqual(page.quality_spinbox.text(), str(DEFAULT_MANUAL_QUALITY))
-                    self.assertFalse(page.quality_reset_button.isEnabled())
+                self.assertFalse(page.quality_reset_button.isEnabled())
                 self.assertTrue(window.feature_nav_items[MODE_WATERMARK].isHidden())
                 self.assertTrue(
                     window.comprehensive_page.feature_sections[MODE_WATERMARK].isHidden()
                 )
 
-                window.comprehensive_page.watermark_checkbox.setChecked(True)
-                self.assertFalse(window.comprehensive_page._get_apply_watermark())
-                self.assertEqual(
-                    window.comprehensive_page._get_watermark_options(),
-                    (None, None),
+                window.settings_page.comprehensive_feature_switches[
+                    MODE_WATERMARK
+                ].setChecked(True)
+                self.process_events()
+                self.assertTrue(window.feature_nav_items[MODE_WATERMARK].isHidden())
+                self.assertFalse(
+                    window.comprehensive_page.feature_sections[MODE_WATERMARK].isHidden()
                 )
+
+                window.comprehensive_page.watermark_checkbox.setChecked(True)
+                self.assertTrue(window.comprehensive_page._get_apply_watermark())
+                watermark_options, watermark_error = (
+                    window.comprehensive_page._get_watermark_options()
+                )
+                self.assertIsNotNone(watermark_options)
+                self.assertIsNone(watermark_error)
 
                 for feature in (
                     MODE_COMPREHENSIVE,
@@ -93,45 +111,121 @@ class GuiFeatureTestCase(unittest.TestCase):
             finally:
                 self.close_window(window)
 
-    def test_switches_gate_comprehensive_features_and_persist(self) -> None:
+    def test_page_and_comprehensive_switches_are_independent_and_persist(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings_path = Path(temp_dir) / "settings.ini"
             window, settings = self.make_window(settings_path)
             try:
-                window.settings_page.feature_switches[MODE_WATERMARK].setChecked(True)
-                window.settings_page.feature_switches[MODE_RESIZE].setChecked(False)
-                window.settings_page.feature_switches[MODE_FORMAT].setChecked(False)
-                window.settings_page.feature_switches[MODE_COMPRESS].setChecked(False)
-                window.settings_page.feature_switches[MODE_LOGO].setChecked(False)
+                expected_page_states = dict(FEATURE_DEFAULTS)
+                expected_page_states.update(
+                    {
+                        MODE_RESIZE: False,
+                        MODE_FORMAT: True,
+                        MODE_COMPRESS: False,
+                        MODE_LOGO: True,
+                        MODE_WATERMARK: True,
+                    }
+                )
+                expected_comprehensive_states = {
+                    MODE_RESIZE: True,
+                    MODE_FORMAT: False,
+                    MODE_COMPRESS: True,
+                    MODE_LOGO: False,
+                    MODE_WATERMARK: False,
+                }
+                for feature, enabled in expected_page_states.items():
+                    window.settings_page.feature_switches[feature].setChecked(enabled)
+                for feature, enabled in expected_comprehensive_states.items():
+                    window.settings_page.comprehensive_feature_switches[feature].setChecked(
+                        enabled
+                    )
                 self.process_events()
 
                 page = window.comprehensive_page
-                self.assertFalse(window.feature_nav_items[MODE_WATERMARK].isHidden())
-                self.assertFalse(page.feature_sections[MODE_WATERMARK].isHidden())
-                self.assertIsNone(page._get_output_size())
+                self.assertEqual(window.feature_states, expected_page_states)
+                self.assertEqual(
+                    window.comprehensive_feature_states,
+                    expected_comprehensive_states,
+                )
+                for feature, enabled in expected_page_states.items():
+                    self.assertEqual(
+                        window.feature_nav_items[feature].isHidden(),
+                        not enabled,
+                    )
+                    self.assertEqual(window.feature_pages[feature].isEnabled(), enabled)
+                for feature, enabled in expected_comprehensive_states.items():
+                    self.assertEqual(page.is_feature_enabled(feature), enabled)
+                    self.assertEqual(page.feature_sections[feature].isHidden(), not enabled)
+                self.assertIsNotNone(page._get_output_size())
                 self.assertEqual(page._get_output_choice(), "保持原格式")
-                self.assertIsNone(page._get_manual_quality())
+                self.assertEqual(page._get_manual_quality(), DEFAULT_MANUAL_QUALITY)
                 self.assertFalse(page._get_apply_logo())
-                self.assertTrue(page.output_card.isHidden())
-                self.assertTrue(page.feature_sections[MODE_LOGO].isHidden())
+                self.assertFalse(page._get_apply_watermark())
+                self.assertFalse(page.output_card.isHidden())
+                page_settings = page._get_page_settings()
+                self.assertIsNotNone(page_settings)
+                assert page_settings is not None
+                self.assertIsNotNone(page_settings.output_size)
+                self.assertEqual(page_settings.output_choice, "保持原格式")
+                self.assertEqual(page_settings.quality, DEFAULT_MANUAL_QUALITY)
+                self.assertFalse(page_settings.apply_logo)
+                self.assertIsNone(page_settings.watermark_options)
 
-                page.choose_save_radio.setChecked(True)
-                page._set_processing_state(True)
-                self.assertFalse(page.choose_save_button.isEnabled())
-                page.set_feature_enabled(MODE_FORMAT, True)
-                self.assertFalse(page.choose_save_button.isEnabled())
-                page._set_processing_state(False)
                 settings.sync()
             finally:
                 self.close_window(window)
 
             restored, _ = self.make_window(settings_path)
             try:
-                self.assertTrue(restored.feature_states[MODE_WATERMARK])
-                self.assertFalse(restored.feature_states[MODE_RESIZE])
-                self.assertFalse(restored.feature_states[MODE_FORMAT])
-                self.assertFalse(restored.feature_states[MODE_COMPRESS])
-                self.assertFalse(restored.feature_states[MODE_LOGO])
+                self.assertEqual(restored.feature_states, expected_page_states)
+                self.assertEqual(
+                    restored.comprehensive_feature_states,
+                    expected_comprehensive_states,
+                )
+                for feature, enabled in expected_comprehensive_states.items():
+                    self.assertEqual(
+                        restored.comprehensive_page.is_feature_enabled(feature),
+                        enabled,
+                    )
+                    self.assertEqual(
+                        restored.comprehensive_page.feature_sections[feature].isHidden(),
+                        not enabled,
+                    )
+            finally:
+                self.close_window(restored)
+
+    def test_legacy_global_switches_are_migrated_once_then_decoupled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "settings.ini"
+            legacy_settings = QSettings(str(settings_path), QSettings.IniFormat)
+            legacy_settings.setValue(feature_setting_key(MODE_RESIZE), False)
+            legacy_settings.setValue(feature_setting_key(MODE_WATERMARK), True)
+            legacy_settings.sync()
+
+            window, settings = self.make_window(settings_path)
+            try:
+                self.assertFalse(window.feature_states[MODE_RESIZE])
+                self.assertTrue(window.feature_states[MODE_WATERMARK])
+                self.assertFalse(window.comprehensive_feature_states[MODE_RESIZE])
+                self.assertTrue(window.comprehensive_feature_states[MODE_WATERMARK])
+                for feature in COMPREHENSIVE_FEATURES:
+                    self.assertTrue(
+                        settings.contains(comprehensive_feature_setting_key(feature))
+                    )
+
+                window.settings_page.feature_switches[MODE_RESIZE].setChecked(True)
+                window.settings_page.feature_switches[MODE_WATERMARK].setChecked(False)
+                self.process_events()
+                settings.sync()
+            finally:
+                self.close_window(window)
+
+            restored, _ = self.make_window(settings_path)
+            try:
+                self.assertTrue(restored.feature_states[MODE_RESIZE])
+                self.assertFalse(restored.feature_states[MODE_WATERMARK])
+                self.assertFalse(restored.comprehensive_feature_states[MODE_RESIZE])
+                self.assertTrue(restored.comprehensive_feature_states[MODE_WATERMARK])
             finally:
                 self.close_window(restored)
 

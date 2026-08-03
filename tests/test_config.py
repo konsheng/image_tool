@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from config import (
+    COMPREHENSIVE_FEATURE_DEFAULTS,
     DEFAULT_MANUAL_QUALITY,
     FEATURE_DEFAULTS,
     FEATURE_WATERMARK,
@@ -19,10 +20,18 @@ class CompressionDefaultsTestCase(unittest.TestCase):
 
     def test_only_watermark_is_disabled_by_default(self) -> None:
         self.assertFalse(FEATURE_DEFAULTS[FEATURE_WATERMARK])
+        self.assertFalse(COMPREHENSIVE_FEATURE_DEFAULTS[FEATURE_WATERMARK])
         self.assertTrue(
             all(
                 enabled
                 for feature, enabled in FEATURE_DEFAULTS.items()
+                if feature != FEATURE_WATERMARK
+            )
+        )
+        self.assertTrue(
+            all(
+                enabled
+                for feature, enabled in COMPREHENSIVE_FEATURE_DEFAULTS.items()
                 if feature != FEATURE_WATERMARK
             )
         )

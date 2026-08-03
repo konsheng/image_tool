@@ -84,6 +84,8 @@ from config import (
     APP_AUTHOR,
     APP_NAME,
     APP_VERSION,
+    COMPREHENSIVE_FEATURE_DEFAULTS,
+    COMPREHENSIVE_FEATURE_SETTINGS_PREFIX,
     CUSTOM_SIZE_LABEL,
     DEFAULT_MANUAL_QUALITY,
     DEFAULT_WATERMARK_ANGLE,
@@ -359,6 +361,30 @@ def load_feature_states(settings: QSettings) -> dict[str, bool]:
         feature: settings.value(feature_setting_key(feature), default, type=bool)
         for feature, default in FEATURE_DEFAULTS.items()
     }
+
+
+def comprehensive_feature_setting_key(feature: str) -> str:
+    return f"{COMPREHENSIVE_FEATURE_SETTINGS_PREFIX}/{feature}/enabled"
+
+
+def load_comprehensive_feature_states(settings: QSettings) -> dict[str, bool]:
+    states: dict[str, bool] = {}
+    migrated = False
+    for feature in COMPREHENSIVE_FEATURES:
+        key = comprehensive_feature_setting_key(feature)
+        default = COMPREHENSIVE_FEATURE_DEFAULTS[feature]
+        if settings.contains(key):
+            enabled = settings.value(key, default, type=bool)
+        else:
+            # Older versions used one global switch for both the independent
+            # page and the matching feature inside comprehensive processing.
+            enabled = settings.value(feature_setting_key(feature), default, type=bool)
+            settings.setValue(key, enabled)
+            migrated = True
+        states[feature] = enabled
+    if migrated:
+        settings.sync()
+    return states
 
 
 class PreviewImageLabel(QLabel):
@@ -2758,13 +2784,17 @@ class SettingsPage(QWidget):
         on_theme_changed,
         feature_states: dict[str, bool],
         on_feature_changed,
+        comprehensive_feature_states: dict[str, bool],
+        on_comprehensive_feature_changed,
     ) -> None:
         super().__init__()
         self.setObjectName("settingsPage")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.on_theme_changed = on_theme_changed
         self.on_feature_changed = on_feature_changed
+        self.on_comprehensive_feature_changed = on_comprehensive_feature_changed
         self.feature_switches: dict[str, SwitchButton] = {}
+        self.comprehensive_feature_switches: dict[str, SwitchButton] = {}
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(28, 24, 28, 28)
@@ -2797,39 +2827,31 @@ class SettingsPage(QWidget):
 
         root_layout.addWidget(card)
 
-        feature_card = CardWidget(self)
-        feature_card.setObjectName("PanelCard")
-        feature_layout = QVBoxLayout(feature_card)
-        feature_layout.setContentsMargins(18, 16, 18, 16)
-        feature_layout.setSpacing(12)
-
-        feature_title = QLabel("功能开关", self)
-        feature_title.setObjectName("SectionTitle")
-        feature_layout.addWidget(feature_title)
-
-        feature_hint = QLabel(
-            "关闭后会隐藏对应入口；尺寸、格式、压缩、LOGO和水印也会从综合处理中停用。",
-            self,
+        switch_cards = QHBoxLayout()
+        switch_cards.setSpacing(14)
+        switch_cards.addWidget(
+            self._build_switch_card(
+                "独立页面",
+                "仅控制左侧导航中的对应页面，不影响综合处理里的功能。",
+                tuple(FEATURE_LABELS),
+                feature_states,
+                FEATURE_DEFAULTS,
+                self.feature_switches,
+            ),
+            1,
         )
-        feature_hint.setObjectName("MutedLabel")
-        feature_hint.setWordWrap(True)
-        feature_layout.addWidget(feature_hint)
-
-        for feature, label in FEATURE_LABELS.items():
-            row = QHBoxLayout()
-            row.setSpacing(10)
-            display_label = f"{label}（默认关闭）" if feature == MODE_WATERMARK else label
-            row.addWidget(QLabel(display_label, self))
-            row.addStretch(1)
-            switch = SwitchButton(feature_card)
-            switch.setOnText("开启")
-            switch.setOffText("关闭")
-            switch.setChecked(feature_states.get(feature, FEATURE_DEFAULTS[feature]))
-            row.addWidget(switch)
-            feature_layout.addLayout(row)
-            self.feature_switches[feature] = switch
-
-        root_layout.addWidget(feature_card)
+        switch_cards.addWidget(
+            self._build_switch_card(
+                "综合处理功能",
+                "仅控制综合处理页面中的对应功能，不影响独立页面。",
+                COMPREHENSIVE_FEATURES,
+                comprehensive_feature_states,
+                COMPREHENSIVE_FEATURE_DEFAULTS,
+                self.comprehensive_feature_switches,
+            ),
+            1,
+        )
+        root_layout.addLayout(switch_cards)
         root_layout.addStretch(1)
 
         self.theme_combo.currentTextChanged.connect(self._theme_changed)
@@ -2837,7 +2859,55 @@ class SettingsPage(QWidget):
             switch.checkedChanged.connect(
                 lambda checked, feature=feature: self.on_feature_changed(feature, checked)
             )
+        for feature, switch in self.comprehensive_feature_switches.items():
+            switch.checkedChanged.connect(
+                lambda checked, feature=feature: self.on_comprehensive_feature_changed(
+                    feature,
+                    checked,
+                )
+            )
         self.apply_theme_styles()
+
+    def _build_switch_card(
+        self,
+        title: str,
+        hint: str,
+        features: tuple[str, ...],
+        states: dict[str, bool],
+        defaults: dict[str, bool],
+        switches: dict[str, SwitchButton],
+    ) -> CardWidget:
+        card = CardWidget(self)
+        card.setObjectName("PanelCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        title_label = QLabel(title, card)
+        title_label.setObjectName("SectionTitle")
+        layout.addWidget(title_label)
+
+        hint_label = QLabel(hint, card)
+        hint_label.setObjectName("MutedLabel")
+        hint_label.setWordWrap(True)
+        layout.addWidget(hint_label)
+
+        for feature in features:
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            label = FEATURE_LABELS[feature]
+            display_label = f"{label}（默认关闭）" if not defaults[feature] else label
+            row.addWidget(QLabel(display_label, card))
+            row.addStretch(1)
+            switch = SwitchButton(card)
+            switch.setOnText("开启")
+            switch.setOffText("关闭")
+            switch.setChecked(states.get(feature, defaults[feature]))
+            row.addWidget(switch)
+            layout.addLayout(row)
+            switches[feature] = switch
+
+        return card
 
     def apply_theme_styles(self) -> None:
         apply_background(self, theme_colors()["page"])
@@ -3079,6 +3149,7 @@ class ImageToolWindow(FluentWindow):
         settings = settings or QSettings("ImageTool", APP_NAME)
         theme_value = load_theme_value(settings)
         feature_states = load_feature_states(settings)
+        comprehensive_feature_states = load_comprehensive_feature_states(settings)
         processing_statistics = load_processing_statistics(settings)
         setTheme(THEME_MAP[theme_value])
 
@@ -3099,6 +3170,7 @@ class ImageToolWindow(FluentWindow):
         self.settings = settings
         self.theme_value = theme_value
         self.feature_states = feature_states
+        self.comprehensive_feature_states = comprehensive_feature_states
         self.processing_statistics = processing_statistics
         self.preview_collapsed = False
 
@@ -3117,6 +3189,8 @@ class ImageToolWindow(FluentWindow):
             self._set_theme_mode,
             self.feature_states,
             self._set_feature_enabled,
+            self.comprehensive_feature_states,
+            self._set_comprehensive_feature_enabled,
         )
         self.about_page = AboutPage()
         self.feature_pages = {
@@ -3187,6 +3261,12 @@ class ImageToolWindow(FluentWindow):
                 enabled,
                 persist=False,
                 ensure_current=False,
+            )
+        for feature, enabled in self.comprehensive_feature_states.items():
+            self._set_comprehensive_feature_enabled(
+                feature,
+                enabled,
+                persist=False,
             )
         self.switchTo(self._first_enabled_page())
         self._apply_theme_styles()
@@ -3268,11 +3348,25 @@ class ImageToolWindow(FluentWindow):
         if nav_item is not None:
             nav_item.setVisible(enabled)
 
-        if feature in COMPREHENSIVE_FEATURES:
-            self.comprehensive_page.set_feature_enabled(feature, enabled)
-
         if persist:
             self.settings.setValue(feature_setting_key(feature), enabled)
+
+    def _set_comprehensive_feature_enabled(
+        self,
+        feature: str,
+        enabled: bool,
+        *,
+        persist: bool = True,
+    ) -> None:
+        if feature not in COMPREHENSIVE_FEATURES:
+            return
+
+        enabled = bool(enabled)
+        self.comprehensive_feature_states[feature] = enabled
+        self.comprehensive_page.set_feature_enabled(feature, enabled)
+
+        if persist:
+            self.settings.setValue(comprehensive_feature_setting_key(feature), enabled)
 
     def _set_theme_mode(self, value: str) -> None:
         if value not in THEME_MAP:
