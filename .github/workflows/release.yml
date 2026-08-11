@@ -53,7 +53,7 @@ jobs:
       - name: Compile source
         shell: pwsh
         run: |
-          python -m compileall main.py gui.py image_processor.py compressor.py logo_manager.py file_utils.py config.py
+          python -m compileall main.py gui.py image_processor.py compressor.py logo_manager.py file_utils.py memo_store.py config.py
 
       - name: Run tests
         shell: pwsh
@@ -79,6 +79,36 @@ jobs:
 
           Write-Host "Executable size: $([math]::Round($item.Length / 1MB, 2)) MB"
 
+          $archiveListing = (& pyi-archive_viewer --list --brief $exe 2>&1) | Out-String
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to inspect executable archive."
+          }
+
+          $requiredEntries = @(
+            "assets\fonts\SourceHanSansCN-Medium.otf",
+            "assets\fonts\LICENSE.txt",
+            "assets\fonts\SOURCE.md"
+          )
+          foreach ($entry in $requiredEntries) {
+            if (-not $archiveListing.Contains($entry)) {
+              throw "Required bundled resource is missing from executable: $entry"
+            }
+          }
+
+          $process = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden
+          try {
+            Start-Sleep -Seconds 5
+            $process.Refresh()
+            if ($process.HasExited) {
+              throw "Executable exited during startup smoke test with code $($process.ExitCode)."
+            }
+          } finally {
+            $process.Refresh()
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
+
       - name: Create release package
         shell: pwsh
         run: |
@@ -94,8 +124,11 @@ jobs:
           }
 
           New-Item -ItemType Directory -Path $packageDir | Out-Null
+          New-Item -ItemType Directory -Path "$packageDir\THIRD_PARTY_LICENSES" | Out-Null
           Copy-Item "dist\图片处理工具.exe" "$packageDir\图片处理工具.exe"
           Copy-Item "README.md" "$packageDir\README.md"
+          Copy-Item "assets\fonts\LICENSE.txt" "$packageDir\THIRD_PARTY_LICENSES\SourceHanSans-LICENSE.txt"
+          Copy-Item "assets\fonts\SOURCE.md" "$packageDir\THIRD_PARTY_LICENSES\SourceHanSans-SOURCE.md"
           Compress-Archive -Path "$packageDir\*" -DestinationPath $zipPath -Force
 
           if (-not (Test-Path $zipPath)) {

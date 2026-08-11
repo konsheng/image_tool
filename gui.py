@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from io import BytesIO
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +30,7 @@ from PySide6.QtGui import (
     QDropEvent,
     QIcon,
     QKeyEvent,
+    QKeySequence,
     QMouseEvent,
     QPalette,
     QPixmap,
@@ -52,6 +54,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from qfluentwidgets import (
+    Action,
+    BodyLabel,
     CardWidget,
     CheckBox,
     ComboBox,
@@ -63,14 +67,21 @@ from qfluentwidgets import (
     InfoBarPosition,
     LineEdit,
     ListWidget,
+    MessageBox,
+    MessageBoxBase,
     NavigationItemPosition,
+    PlainTextEdit,
     PrimaryPushButton,
+    PrimarySplitPushButton,
     ProgressBar,
     PushButton,
     RadioButton,
+    RoundMenu,
+    SearchLineEdit,
     Slider,
     SmoothScrollArea,
     SpinBox,
+    SubtitleLabel,
     SwitchButton,
     TableWidget,
     Theme,
@@ -88,6 +99,11 @@ from config import (
     COMPREHENSIVE_FEATURE_SETTINGS_PREFIX,
     CUSTOM_SIZE_LABEL,
     DEFAULT_MANUAL_QUALITY,
+    DEFAULT_REFERENCE_NOTICE_AUTO_FONT_SIZE,
+    DEFAULT_REFERENCE_NOTICE_BACKGROUND_OPACITY,
+    DEFAULT_REFERENCE_NOTICE_FONT_SIZE,
+    DEFAULT_REFERENCE_NOTICE_POSITION,
+    DEFAULT_REFERENCE_NOTICE_TEXT,
     DEFAULT_WATERMARK_ANGLE,
     DEFAULT_WATERMARK_COLOR,
     DEFAULT_WATERMARK_FONT_SIZE,
@@ -110,6 +126,8 @@ from config import (
     FEATURE_FORMAT,
     FEATURE_LABELS,
     FEATURE_LOGO,
+    FEATURE_MEMO,
+    FEATURE_REFERENCE_NOTICE,
     FEATURE_RESIZE,
     FEATURE_SETTINGS_PREFIX,
     FEATURE_WATERMARK,
@@ -117,12 +135,17 @@ from config import (
     MAX_MANUAL_QUALITY,
     MAX_OUTPUT_DIMENSION,
     MAX_OUTPUT_PIXELS,
+    MAX_REFERENCE_NOTICE_TEXT_LENGTH,
     MIN_MANUAL_QUALITY,
     OUTPUT_FORMATS,
     OUTPUT_SIZE_PRESETS,
     PROJECT_ISSUES_URL,
     PROJECT_RELEASES_URL,
     PROJECT_URL,
+    REFERENCE_NOTICE_FONT_NAME,
+    REFERENCE_NOTICE_FONT_RELATIVE_PATH,
+    REFERENCE_NOTICE_LICENSE_RELATIVE_PATH,
+    REFERENCE_NOTICE_POSITIONS,
     STATUS_CANCELED,
     STATUS_FAILED,
     STATUS_PENDING,
@@ -150,15 +173,29 @@ from file_utils import (
 )
 from image_processor import (
     ProcessOptions,
+    ReferenceNoticeOptions,
     WatermarkOptions,
     create_watermark_layer,
     get_image_info,
     process_image,
     render_encoded_preview_image,
     render_preview_image,
+    resolve_watermark_options_for_reference_notice,
     watermark_position_for_layer,
 )
-from logo_manager import LogoAsset, list_logo_assets, load_logo_assets
+from logo_manager import LogoAsset, list_logo_assets, load_logo_assets, resource_path
+from memo_store import (
+    MEMO_FILENAME,
+    MemoDocument,
+    MemoNote,
+    MemoStore,
+    MemoStoreError,
+    create_note,
+    delete_note,
+    find_note,
+    set_note_pinned,
+    update_note,
+)
 
 
 MODE_COMPREHENSIVE = FEATURE_COMPREHENSIVE
@@ -167,6 +204,8 @@ MODE_FORMAT = FEATURE_FORMAT
 MODE_COMPRESS = FEATURE_COMPRESS
 MODE_LOGO = FEATURE_LOGO
 MODE_WATERMARK = FEATURE_WATERMARK
+MODE_REFERENCE_NOTICE = FEATURE_REFERENCE_NOTICE
+MODE_MEMO = FEATURE_MEMO
 
 COMPREHENSIVE_FEATURES = (
     MODE_RESIZE,
@@ -174,6 +213,7 @@ COMPREHENSIVE_FEATURES = (
     MODE_COMPRESS,
     MODE_LOGO,
     MODE_WATERMARK,
+    MODE_REFERENCE_NOTICE,
 )
 
 LOGO_ICON_SIZE = QSize(96, 64)
@@ -196,6 +236,8 @@ THEME_SETTING_KEY = "themeMode"
 STATISTICS_PROCESSED_COUNT_KEY = "statistics/processed_count"
 STATISTICS_SOURCE_BYTES_KEY = "statistics/source_bytes"
 STATISTICS_OUTPUT_BYTES_KEY = "statistics/output_bytes"
+MEMO_STORAGE_DIRECTORY_SETTING_KEY = "memo/storage_directory"
+MEMO_AUTOSAVE_DELAY_MS = 800
 THEME_LABELS = {
     "浅色": "light",
     "暗色": "dark",
@@ -221,6 +263,7 @@ def theme_colors() -> dict[str, str]:
             "preview": "#202124",
             "preview_text": "#cfcfcf",
             "accent_text": "#62dbe2",
+            "danger": "#ff8a8a",
         }
 
     return {
@@ -233,6 +276,7 @@ def theme_colors() -> dict[str, str]:
         "preview": "#fafafa",
         "preview_text": "#666666",
         "accent_text": "#007f86",
+        "danger": "#c42b1c",
     }
 
 
@@ -272,6 +316,8 @@ def theme_stylesheet() -> str:
         #compressPage,
         #logoPage,
         #watermarkPage,
+        #referenceNoticePage,
+        #memoPage,
         #settingsPage,
         #aboutPage,
         #PageContainer,
@@ -335,6 +381,9 @@ def theme_stylesheet() -> str:
         }}
         #MutedLabel {{
             color: {colors["muted"]};
+        }}
+        #ErrorLabel {{
+            color: {colors["danger"]};
         }}
         #PreviewImage {{
             border: 1px solid {colors["preview_border"]};
@@ -566,6 +615,7 @@ class PageSettings:
     apply_logo: bool
     logo_assets: list[LogoAsset]
     watermark_options: WatermarkOptions | None
+    reference_notice_options: ReferenceNoticeOptions | None = None
 
 
 @dataclass(frozen=True)
@@ -585,6 +635,8 @@ class PreviewOutcome:
     file_name: str
     source_size: int
     watermark_options: WatermarkOptions | None
+    reference_notice_options: ReferenceNoticeOptions | None
+    watermark_shifted: bool = False
 
 
 class PreviewWorker(QObject):
@@ -607,6 +659,7 @@ class PreviewWorker(QObject):
                 apply_logo=request.options.apply_logo,
                 logos=logos,
                 watermark_options=request.options.watermark_options,
+                reference_notice_options=request.options.reference_notice_options,
             )
             if request.options.quality is None:
                 image = render_preview_image(request.source_path, options)
@@ -616,6 +669,17 @@ class PreviewWorker(QObject):
                 image = encoded.image
                 compression = encoded.compression
 
+            watermark_shifted = False
+            if (
+                options.watermark_options is not None
+                and options.reference_notice_options is not None
+            ):
+                _, watermark_shifted = resolve_watermark_options_for_reference_notice(
+                    image.size,
+                    options.watermark_options,
+                    options.reference_notice_options,
+                )
+
             self.succeeded.emit(
                 request.request_id,
                 PreviewOutcome(
@@ -624,6 +688,8 @@ class PreviewWorker(QObject):
                     file_name=request.file_name,
                     source_size=request.source_size,
                     watermark_options=request.options.watermark_options,
+                    reference_notice_options=request.options.reference_notice_options,
+                    watermark_shifted=watermark_shifted,
                 ),
             )
         except Exception as exc:
@@ -646,6 +712,7 @@ class ProcessingWorker(QObject):
         quality: int | None,
         logo_cache: dict[str, Image.Image],
         watermark_options: WatermarkOptions | None,
+        reference_notice_options: ReferenceNoticeOptions | None = None,
     ) -> None:
         super().__init__()
         self.tasks = tasks
@@ -653,6 +720,7 @@ class ProcessingWorker(QObject):
         self.quality = quality
         self.logo_cache = logo_cache
         self.watermark_options = watermark_options
+        self.reference_notice_options = reference_notice_options
         self.cancel_requested = False
 
     def request_cancel(self) -> None:
@@ -688,6 +756,7 @@ class ProcessingWorker(QObject):
                         apply_logo=task.apply_logo,
                         logos=logo_copies,
                         watermark_options=self.watermark_options,
+                        reference_notice_options=self.reference_notice_options,
                     ),
                 )
                 last_output_dir = result.output_path.parent
@@ -712,6 +781,10 @@ class ProcessingWorker(QObject):
                     reason = "水印图片加载失败"
                 elif "请输入水印文字" in reason:
                     reason = "请输入水印文字"
+                elif "参考图提示字体" in reason:
+                    reason = "参考图提示字体加载失败"
+                elif "reference notice text" in reason or "参考图提示文字" in reason:
+                    reason = "请输入参考图提示文字"
                 elif "图片无法打开" not in reason:
                     reason = "图片无法打开"
                 status = f"{STATUS_FAILED}：{reason}"
@@ -769,6 +842,7 @@ class ImageOperationPage(QWidget):
         self._update_custom_size_state()
         self._update_compression_controls_state()
         self._update_watermark_controls_state()
+        self._update_reference_notice_controls_state()
         self._update_result_labels(0, 0, 0)
 
     @property
@@ -802,6 +876,14 @@ class ImageOperationPage(QWidget):
     @property
     def always_apply_watermark(self) -> bool:
         return self.mode == MODE_WATERMARK
+
+    @property
+    def has_optional_reference_notice(self) -> bool:
+        return self.mode == MODE_COMPREHENSIVE
+
+    @property
+    def always_apply_reference_notice(self) -> bool:
+        return self.mode == MODE_REFERENCE_NOTICE
 
     def is_feature_enabled(self, feature: str) -> bool:
         if self.mode != MODE_COMPREHENSIVE:
@@ -840,6 +922,8 @@ class ImageOperationPage(QWidget):
             self._update_compression_controls_state()
         elif feature == MODE_WATERMARK:
             self._update_watermark_controls_state()
+        elif feature == MODE_REFERENCE_NOTICE:
+            self._update_reference_notice_controls_state()
         self._refresh_preview()
 
     def _setup_ui(self) -> None:
@@ -982,6 +1066,12 @@ class ImageOperationPage(QWidget):
             layout.addWidget(self.watermark_card)
             if self.mode == MODE_COMPREHENSIVE:
                 self.feature_sections[MODE_WATERMARK] = self.watermark_card
+
+        if self.has_optional_reference_notice or self.always_apply_reference_notice:
+            self.reference_notice_card = self._build_reference_notice_card()
+            layout.addWidget(self.reference_notice_card)
+            if self.mode == MODE_COMPREHENSIVE:
+                self.feature_sections[MODE_REFERENCE_NOTICE] = self.reference_notice_card
 
         self.output_card = self._build_output_card()
         save_card = self._build_save_card()
@@ -1346,6 +1436,100 @@ class ImageOperationPage(QWidget):
 
         return card
 
+    def _build_reference_notice_card(self) -> CardWidget:
+        card, layout = self._create_card("参考图提示")
+        if self.has_optional_reference_notice:
+            self.reference_notice_checkbox = CheckBox(self)
+            self.reference_notice_checkbox.setText("添加参考图提示")
+            self.reference_notice_checkbox.setChecked(False)
+            layout.addWidget(self.reference_notice_checkbox)
+        else:
+            self._add_readonly_row(layout, "参考图提示", "添加四角贴边角标")
+
+        self.reference_notice_hint_label = QLabel(
+            "白色文字配半透明深色角标，贴紧所选角落对应的两条图片边缘，"
+            "唯一的苹果式连续圆角朝向图片内部；同时启用相同角落的水印时，"
+            "水印会自动避让。",
+            self,
+        )
+        self.reference_notice_hint_label.setObjectName("MutedLabel")
+        self.reference_notice_hint_label.setWordWrap(True)
+        layout.addWidget(self.reference_notice_hint_label)
+
+        text_row = QHBoxLayout()
+        text_row.setSpacing(10)
+        text_row.addWidget(QLabel("提示文字", self))
+        self.reference_notice_text_edit = LineEdit(self)
+        self.reference_notice_text_edit.setText(DEFAULT_REFERENCE_NOTICE_TEXT)
+        self.reference_notice_text_edit.setPlaceholderText(DEFAULT_REFERENCE_NOTICE_TEXT)
+        self.reference_notice_text_edit.setMaxLength(MAX_REFERENCE_NOTICE_TEXT_LENGTH)
+        text_row.addWidget(self.reference_notice_text_edit, 1)
+        layout.addLayout(text_row)
+
+        font_row = QHBoxLayout()
+        font_row.setSpacing(10)
+        font_row.addWidget(QLabel("字体", self))
+        self.reference_notice_font_label = QLabel(
+            f"{REFERENCE_NOTICE_FONT_NAME}（SIL OFL 1.1）",
+            self,
+        )
+        self.reference_notice_font_label.setObjectName("MutedLabel")
+        font_row.addWidget(self.reference_notice_font_label)
+        font_row.addStretch(1)
+        layout.addLayout(font_row)
+
+        font_size_row = QHBoxLayout()
+        font_size_row.setSpacing(10)
+        self.reference_notice_auto_font_checkbox = CheckBox(self)
+        self.reference_notice_auto_font_checkbox.setText("自动字号")
+        self.reference_notice_auto_font_checkbox.setChecked(
+            DEFAULT_REFERENCE_NOTICE_AUTO_FONT_SIZE
+        )
+        font_size_row.addWidget(self.reference_notice_auto_font_checkbox)
+        font_size_row.addWidget(QLabel("字号", self))
+        self.reference_notice_font_size_edit = LineEdit(self)
+        self.reference_notice_font_size_edit.setText(
+            str(DEFAULT_REFERENCE_NOTICE_FONT_SIZE)
+        )
+        self.reference_notice_font_size_edit.setFixedWidth(70)
+        font_size_row.addWidget(self.reference_notice_font_size_edit)
+        font_size_row.addStretch(1)
+        layout.addLayout(font_size_row)
+
+        position_row = QHBoxLayout()
+        position_row.setSpacing(10)
+        position_row.addWidget(QLabel("位置", self))
+        self.reference_notice_position_combo = ComboBox(self)
+        for position in REFERENCE_NOTICE_POSITIONS:
+            self.reference_notice_position_combo.addItem(
+                f"{position}角",
+                userData=position,
+            )
+        self.reference_notice_position_combo.setCurrentIndex(
+            self.reference_notice_position_combo.findData(
+                DEFAULT_REFERENCE_NOTICE_POSITION
+            )
+        )
+        self.reference_notice_position_combo.setFixedWidth(150)
+        position_row.addWidget(self.reference_notice_position_combo)
+        position_row.addStretch(1)
+        layout.addLayout(position_row)
+
+        appearance_row = QHBoxLayout()
+        appearance_row.setSpacing(10)
+        appearance_row.addWidget(QLabel("背景透明度", self))
+        self.reference_notice_opacity_edit = LineEdit(self)
+        self.reference_notice_opacity_edit.setText(
+            str(DEFAULT_REFERENCE_NOTICE_BACKGROUND_OPACITY)
+        )
+        self.reference_notice_opacity_edit.setFixedWidth(70)
+        appearance_row.addWidget(self.reference_notice_opacity_edit)
+        appearance_row.addWidget(QLabel("%", self))
+        appearance_row.addStretch(1)
+        layout.addLayout(appearance_row)
+
+        return card
+
     def _build_save_card(self) -> CardWidget:
         card, layout = self._create_card("保存方式")
         self.save_group = QButtonGroup(self)
@@ -1496,6 +1680,28 @@ class ImageOperationPage(QWidget):
             self.watermark_tile_offset_y_edit.textChanged.connect(self._refresh_preview)
             self.preview_image_label.drag_started.connect(self._on_preview_watermark_drag_started)
             self.preview_image_label.dragged.connect(self._on_preview_watermark_dragged)
+        if self.has_optional_reference_notice:
+            self.reference_notice_checkbox.stateChanged.connect(
+                self._update_reference_notice_controls_state
+            )
+            self.reference_notice_checkbox.stateChanged.connect(self._refresh_preview)
+        if self.has_optional_reference_notice or self.always_apply_reference_notice:
+            self.reference_notice_text_edit.textChanged.connect(self._refresh_preview)
+            self.reference_notice_auto_font_checkbox.stateChanged.connect(
+                self._update_reference_notice_controls_state
+            )
+            self.reference_notice_auto_font_checkbox.stateChanged.connect(
+                self._refresh_preview
+            )
+            self.reference_notice_font_size_edit.textChanged.connect(
+                self._refresh_preview
+            )
+            self.reference_notice_position_combo.currentTextChanged.connect(
+                self._refresh_preview
+            )
+            self.reference_notice_opacity_edit.textChanged.connect(
+                self._refresh_preview
+            )
 
     def _toggle_preview_sidebar(self, *_args) -> None:
         self.preview_collapse_requested.emit(not self.preview_collapsed)
@@ -1786,6 +1992,26 @@ class ImageOperationPage(QWidget):
         self.watermark_tile_offset_x_edit.setEnabled(enabled and is_tile)
         self.watermark_tile_offset_y_edit.setEnabled(enabled and is_tile)
 
+    def _update_reference_notice_controls_state(self, *_args) -> None:
+        if not (
+            self.has_optional_reference_notice
+            or self.always_apply_reference_notice
+        ):
+            return
+
+        processing = self.processing_active
+        apply_notice = self._get_apply_reference_notice()
+        enabled = apply_notice and not processing
+        auto_font = self.reference_notice_auto_font_checkbox.isChecked()
+
+        if self.has_optional_reference_notice:
+            self.reference_notice_checkbox.setEnabled(not processing)
+        self.reference_notice_text_edit.setEnabled(enabled)
+        self.reference_notice_auto_font_checkbox.setEnabled(enabled)
+        self.reference_notice_font_size_edit.setEnabled(enabled and not auto_font)
+        self.reference_notice_position_combo.setEnabled(enabled)
+        self.reference_notice_opacity_edit.setEnabled(enabled)
+
     def _refresh_preview(self, *_args) -> None:
         if not hasattr(self, "preview_image_label"):
             return
@@ -1835,6 +2061,13 @@ class ImageOperationPage(QWidget):
             self._set_preview_message(watermark_error)
             return
 
+        reference_notice_options, reference_notice_error = (
+            self._get_reference_notice_options()
+        )
+        if reference_notice_error:
+            self._set_preview_message(reference_notice_error)
+            return
+
         try:
             item = self.items[row]
             output_format, _ = resolve_output_format(self._get_output_choice(), item.path)
@@ -1851,6 +2084,7 @@ class ImageOperationPage(QWidget):
                     apply_logo=apply_logo,
                     logos=[],
                     watermark_options=watermark_options,
+                    reference_notice_options=reference_notice_options,
                 ),
                 logo_assets=list(logo_assets),
             )
@@ -1896,8 +2130,10 @@ class ImageOperationPage(QWidget):
             outcome.image,
             outcome.file_name,
             outcome.watermark_options,
+            outcome.reference_notice_options,
             outcome.compression,
             outcome.source_size,
+            watermark_shifted=outcome.watermark_shifted,
         )
 
     def _on_preview_failed(self, request_id: int, reason: str) -> None:
@@ -1926,6 +2162,10 @@ class ImageOperationPage(QWidget):
             return "请选择水印图片"
         if "请输入水印文字" in reason:
             return "请输入水印文字"
+        if "参考图提示字体" in reason:
+            return "参考图提示字体加载失败"
+        if "reference notice text" in reason or "参考图提示文字" in reason:
+            return "请输入参考图提示文字"
         if "图片无法打开" in reason:
             return "图片无法打开"
         return "预览生成失败"
@@ -1942,8 +2182,11 @@ class ImageOperationPage(QWidget):
         image: Image.Image,
         file_name: str,
         watermark_options: WatermarkOptions | None,
+        reference_notice_options: ReferenceNoticeOptions | None,
         compression: object | None = None,
         source_size: int | None = None,
+        *,
+        watermark_shifted: bool = False,
     ) -> None:
         preview = image.copy()
         max_width = max(220, self.preview_image_label.width() - 24)
@@ -1957,7 +2200,11 @@ class ImageOperationPage(QWidget):
 
         self.preview_image_label.setText("")
         self.preview_image_label.set_preview_pixmap(pixmap, image.size)
-        self.preview_image_label.set_drag_enabled(watermark_options is not None and not self.processing_active)
+        self.preview_image_label.set_drag_enabled(
+            watermark_options is not None
+            and not watermark_shifted
+            and not self.processing_active
+        )
         self.current_preview_image_size = image.size
         lines = [f"{file_name}    {image.width}×{image.height}"]
         if compression is not None:
@@ -2267,6 +2514,7 @@ class ImageOperationPage(QWidget):
             quality=settings.quality,
             logo_cache=logo_cache,
             watermark_options=settings.watermark_options,
+            reference_notice_options=settings.reference_notice_options,
         )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
@@ -2325,6 +2573,14 @@ class ImageOperationPage(QWidget):
             self._show_message("warning", watermark_error)
             return None
 
+
+        reference_notice_options, reference_notice_error = (
+            self._get_reference_notice_options()
+        )
+        if reference_notice_error:
+            self._show_message("warning", reference_notice_error)
+            return None
+
         return PageSettings(
             output_size=output_size,
             output_choice=self._get_output_choice(),
@@ -2332,6 +2588,7 @@ class ImageOperationPage(QWidget):
             apply_logo=self._get_apply_logo(),
             logo_assets=logo_assets,
             watermark_options=watermark_options,
+            reference_notice_options=reference_notice_options,
         )
 
     def _prepare_tasks(self, settings: PageSettings) -> list[ProcessingTask]:
@@ -2620,6 +2877,63 @@ class ImageOperationPage(QWidget):
             None,
         )
 
+    def _get_apply_reference_notice(self) -> bool:
+        if not self.is_feature_enabled(MODE_REFERENCE_NOTICE):
+            return False
+        if self.always_apply_reference_notice:
+            return True
+        if self.has_optional_reference_notice:
+            return self.reference_notice_checkbox.isChecked()
+        return False
+
+    def _get_reference_notice_options(
+        self,
+    ) -> tuple[ReferenceNoticeOptions | None, str | None]:
+        if not self._get_apply_reference_notice():
+            return None, None
+
+        text = self.reference_notice_text_edit.text().strip()
+        if not text:
+            return None, "请输入参考图提示文字"
+
+        font_size = 0
+        if not self.reference_notice_auto_font_checkbox.isChecked():
+            parsed_font_size = self._read_int_value(
+                self.reference_notice_font_size_edit,
+                1,
+                500,
+            )
+            if parsed_font_size is None:
+                return None, "请输入正确的参考图提示字号"
+            font_size = parsed_font_size
+
+        background_opacity = self._read_int_value(
+            self.reference_notice_opacity_edit,
+            1,
+            100,
+        )
+        if background_opacity is None:
+            return None, "请输入正确的提示背景透明度"
+
+        position = self.reference_notice_position_combo.currentData()
+        if position not in REFERENCE_NOTICE_POSITIONS:
+            return None, "请选择正确的参考图提示位置"
+
+        font_path = resource_path(REFERENCE_NOTICE_FONT_RELATIVE_PATH)
+        if not font_path.is_file():
+            return None, "参考图提示字体文件缺失"
+
+        return (
+            ReferenceNoticeOptions(
+                text=text,
+                font_path=font_path,
+                font_size=font_size,
+                background_opacity=background_opacity,
+                position=position,
+            ),
+            None,
+        )
+
     def _load_watermark_image(self, path: Path) -> Image.Image:
         try:
             with Image.open(path) as image:
@@ -2666,6 +2980,8 @@ class ImageOperationPage(QWidget):
             self._update_compression_controls_state()
         if self.has_optional_watermark or self.always_apply_watermark:
             self._update_watermark_controls_state()
+        if self.has_optional_reference_notice or self.always_apply_reference_notice:
+            self._update_reference_notice_controls_state()
         for button in self.save_group.buttons():
             button.setEnabled(not processing)
         self.choose_save_button.setEnabled(not processing and self.choose_save_radio.isChecked())
@@ -2777,6 +3093,758 @@ class ImageOperationPage(QWidget):
             InfoBar.info(**kwargs)
 
 
+class MemoDirectoryChoiceDialog(MessageBoxBase):
+    MIGRATE = "migrate"
+    READ = "read"
+    EMPTY = "empty"
+
+    def __init__(
+        self,
+        target_directory: Path,
+        *,
+        has_current_notes: bool,
+        has_existing_file: bool,
+        parent: QWidget,
+    ) -> None:
+        super().__init__(parent)
+        self.widget.setMinimumWidth(620)
+
+        title_label = SubtitleLabel("更换备忘录存储目录", self.widget)
+        content_label = BodyLabel(
+            "请选择新目录中的数据处理方式。迁移或创建空白内容时，"
+            "若目标文件已存在，会先保留一份 .bak 备份。",
+            self.widget,
+        )
+        content_label.setWordWrap(True)
+        path_label = BodyLabel(str(target_directory), self.widget)
+        path_label.setWordWrap(True)
+        path_label.setObjectName("MutedLabel")
+
+        self.choice_group = QButtonGroup(self)
+        self.migrate_radio = RadioButton("将当前备忘录复制到新目录", self.widget)
+        self.read_radio = RadioButton("读取新目录中已有的备忘录", self.widget)
+        self.empty_radio = RadioButton("在新目录创建空白备忘录", self.widget)
+        for button in (self.migrate_radio, self.read_radio, self.empty_radio):
+            self.choice_group.addButton(button)
+
+        self.migrate_radio.setEnabled(has_current_notes)
+        self.read_radio.setEnabled(has_existing_file)
+        if has_current_notes:
+            self.migrate_radio.setChecked(True)
+        elif has_existing_file:
+            self.read_radio.setChecked(True)
+        else:
+            self.empty_radio.setChecked(True)
+
+        self.viewLayout.addWidget(title_label)
+        self.viewLayout.addWidget(content_label)
+        self.viewLayout.addWidget(path_label)
+        self.viewLayout.addSpacing(4)
+        self.viewLayout.addWidget(self.migrate_radio)
+        self.viewLayout.addWidget(self.read_radio)
+        self.viewLayout.addWidget(self.empty_radio)
+        self.yesButton.setText("继续")
+        self.cancelButton.setText("取消")
+
+    def selected_choice(self) -> str | None:
+        if self.migrate_radio.isChecked():
+            return self.MIGRATE
+        if self.read_radio.isChecked():
+            return self.READ
+        if self.empty_radio.isChecked():
+            return self.EMPTY
+        return None
+
+    def validate(self) -> bool:
+        return self.selected_choice() is not None
+
+
+class MemoPage(QWidget):
+    storage_state_changed = Signal()
+
+    def __init__(self, settings: QSettings) -> None:
+        super().__init__()
+        self.setObjectName("memoPage")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.settings = settings
+        self.storage_directory: Path | None = None
+        self.store: MemoStore | None = None
+        self.document = MemoDocument.empty()
+        self.current_note_id: str | None = None
+        self.storage_ready = False
+        self.storage_message = ""
+        self.storage_message_is_error = False
+        self.dirty = False
+        self.loading_editor = False
+        self.refreshing_list = False
+        self.last_save_error = ""
+
+        self.save_timer = QTimer(self)
+        self.save_timer.setSingleShot(True)
+        self.save_timer.setInterval(MEMO_AUTOSAVE_DELAY_MS)
+        self.save_timer.timeout.connect(self._save_now)
+
+        self._setup_ui()
+        self._connect_signals()
+        self._load_configured_directory()
+        self.apply_theme_styles()
+
+    def _setup_ui(self) -> None:
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(28, 24, 28, 28)
+        root_layout.setSpacing(14)
+
+        title = QLabel("备忘录", self)
+        title.setObjectName("TitleLabel")
+        root_layout.addWidget(title)
+
+        self.storage_notice_label = QLabel("", self)
+        self.storage_notice_label.setObjectName("MutedLabel")
+        self.storage_notice_label.setWordWrap(True)
+        self.storage_notice_label.hide()
+        root_layout.addWidget(self.storage_notice_label)
+
+        content_layout = QHBoxLayout()
+        content_layout.setSpacing(14)
+
+        list_card = CardWidget(self)
+        list_card.setObjectName("PanelCard")
+        list_card.setFixedWidth(290)
+        list_layout = QVBoxLayout(list_card)
+        list_layout.setContentsMargins(16, 16, 16, 16)
+        list_layout.setSpacing(10)
+
+        list_header = QHBoxLayout()
+        list_title = QLabel("备忘录列表", list_card)
+        list_title.setObjectName("SectionTitle")
+        self.note_count_label = QLabel("共 0 条", list_card)
+        self.note_count_label.setObjectName("MutedLabel")
+        list_header.addWidget(list_title)
+        list_header.addStretch(1)
+        list_header.addWidget(self.note_count_label)
+        list_layout.addLayout(list_header)
+
+        self.search_edit = SearchLineEdit(list_card)
+        self.search_edit.setPlaceholderText("搜索标题或正文")
+        list_layout.addWidget(self.search_edit)
+
+        self.new_note_button = PrimaryPushButton("新建备忘录", list_card)
+        self.new_note_button.setIcon(FIF.ADD)
+        list_layout.addWidget(self.new_note_button)
+
+        self.note_list = ListWidget(list_card)
+        self.note_list.setIconSize(QSize(18, 18))
+        self.note_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        list_layout.addWidget(self.note_list, 1)
+        content_layout.addWidget(list_card)
+
+        editor_card = CardWidget(self)
+        editor_card.setObjectName("PanelCard")
+        editor_layout = QVBoxLayout(editor_card)
+        editor_layout.setContentsMargins(18, 16, 18, 16)
+        editor_layout.setSpacing(10)
+
+        editor_header = QHBoxLayout()
+        editor_header.setSpacing(8)
+        self.title_edit = LineEdit(editor_card)
+        self.title_edit.setPlaceholderText("备忘录标题")
+        editor_header.addWidget(self.title_edit, 1)
+
+        self.pin_button = PushButton("置顶", editor_card)
+        self.pin_button.setIcon(FIF.PIN)
+        self.delete_note_button = PushButton("删除", editor_card)
+        self.delete_note_button.setIcon(FIF.DELETE)
+        self.copy_button = PrimarySplitPushButton("复制内容", editor_card, FIF.COPY)
+        self.copy_button.button.setShortcut(QKeySequence("Ctrl+Shift+C"))
+        self.copy_button.setToolTip("复制正文（Ctrl+Shift+C）")
+        self.copy_full_action = Action(FIF.COPY, "复制标题和正文", self)
+        copy_menu = RoundMenu(parent=self.copy_button)
+        copy_menu.addAction(self.copy_full_action)
+        self.copy_button.setFlyout(copy_menu)
+
+        editor_header.addWidget(self.pin_button)
+        editor_header.addWidget(self.delete_note_button)
+        editor_header.addWidget(self.copy_button)
+        editor_layout.addLayout(editor_header)
+
+        self.note_metadata_label = QLabel("请选择或新建备忘录", editor_card)
+        self.note_metadata_label.setObjectName("MutedLabel")
+        editor_layout.addWidget(self.note_metadata_label)
+
+        self.content_edit = PlainTextEdit(editor_card)
+        self.content_edit.setPlaceholderText("在这里记录图片尺寸、格式、客户要求或其他事项…")
+        editor_layout.addWidget(self.content_edit, 1)
+
+        editor_footer = QHBoxLayout()
+        self.save_status_label = QLabel("", editor_card)
+        self.save_status_label.setObjectName("MutedLabel")
+        self.character_count_label = QLabel("0 个字符", editor_card)
+        self.character_count_label.setObjectName("MutedLabel")
+        editor_footer.addWidget(self.save_status_label)
+        editor_footer.addStretch(1)
+        editor_footer.addWidget(self.character_count_label)
+        editor_layout.addLayout(editor_footer)
+
+        content_layout.addWidget(editor_card, 1)
+        root_layout.addLayout(content_layout, 1)
+
+    def _connect_signals(self) -> None:
+        self.new_note_button.clicked.connect(self._create_note)
+        self.note_list.currentItemChanged.connect(self._on_note_selected)
+        self.search_edit.textChanged.connect(self._on_search_changed)
+        self.title_edit.textChanged.connect(self._on_editor_changed)
+        self.content_edit.textChanged.connect(self._on_editor_changed)
+        self.pin_button.clicked.connect(self._toggle_pin)
+        self.delete_note_button.clicked.connect(self._delete_current_note)
+        self.copy_button.clicked.connect(self._copy_current_content)
+        self.copy_full_action.triggered.connect(self._copy_current_full_text)
+
+    def _configured_directory(self) -> Path | None:
+        value = str(self.settings.value(MEMO_STORAGE_DIRECTORY_SETTING_KEY, "")).strip()
+        return Path(value).expanduser() if value else None
+
+    def _load_configured_directory(self) -> None:
+        directory = self._configured_directory()
+        if directory is None:
+            self._set_storage_unavailable(
+                "请先选择一个文件夹保存备忘录。",
+                error=False,
+            )
+            return
+
+        self.storage_directory = directory
+        self.store = MemoStore(directory)
+        if not directory.exists() or not directory.is_dir():
+            self._set_storage_unavailable(
+                "已记忆的存储目录当前不可用。软件不会切换或重建目录，请恢复该目录或重新选择。"
+            )
+            return
+
+        try:
+            document = self.store.load()
+        except MemoStoreError as exc:
+            self._set_storage_unavailable(str(exc))
+            return
+        self._activate_storage(directory, self.store, document, persist=False)
+
+    def _activate_storage(
+        self,
+        directory: Path,
+        store: MemoStore,
+        document: MemoDocument,
+        *,
+        persist: bool = True,
+    ) -> None:
+        self.save_timer.stop()
+        self.storage_directory = directory
+        self.store = store
+        self.document = document
+        self.storage_ready = True
+        self.dirty = False
+        self.last_save_error = ""
+        self.current_note_id = None
+        self.search_edit.blockSignals(True)
+        self.search_edit.clear()
+        self.search_edit.blockSignals(False)
+        self._clear_storage_message()
+        if persist:
+            self.settings.setValue(MEMO_STORAGE_DIRECTORY_SETTING_KEY, str(directory))
+            self.settings.sync()
+        self._refresh_note_list()
+        self._update_control_states()
+        self.save_status_label.setText("已读取本地备忘录")
+        self.storage_state_changed.emit()
+
+    def _set_storage_unavailable(self, message: str, *, error: bool = True) -> None:
+        self.storage_ready = False
+        self.last_save_error = message
+        self._show_storage_message(message, error=error)
+        self._update_control_states()
+        if self.current_note_id is None:
+            self._display_note(None)
+        self.storage_state_changed.emit()
+
+    def _show_storage_message(self, message: str, *, error: bool) -> None:
+        self.storage_message = message
+        self.storage_message_is_error = error
+        self.storage_notice_label.setObjectName(
+            "ErrorLabel" if error else "MutedLabel"
+        )
+        self.storage_notice_label.setText(
+            "备忘录存储不可用，请前往“设置”检查存储位置。"
+            if error
+            else "请先前往“设置”选择备忘录存储目录。"
+        )
+        self.storage_notice_label.show()
+        self.storage_notice_label.style().unpolish(self.storage_notice_label)
+        self.storage_notice_label.style().polish(self.storage_notice_label)
+
+    def _clear_storage_message(self) -> None:
+        self.storage_message = ""
+        self.storage_message_is_error = False
+        self.storage_notice_label.clear()
+        self.storage_notice_label.hide()
+
+    def choose_storage_directory(self, *_args) -> None:
+        start_directory = (
+            str(self.storage_directory)
+            if self.storage_directory is not None and self.storage_directory.exists()
+            else ""
+        )
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "选择备忘录存储目录",
+            start_directory,
+        )
+        if not selected:
+            return
+
+        target_directory = Path(selected)
+        if self.storage_directory is not None:
+            try:
+                if target_directory.resolve() == self.storage_directory.resolve():
+                    self.reload_storage_directory()
+                    return
+            except OSError:
+                pass
+
+        if self.dirty and not self._save_now():
+            self._show_message(
+                "error",
+                "无法更换存储目录",
+                self.last_save_error or "当前备忘录尚未保存，请先检查原存储目录。",
+            )
+            return
+
+        target_store = MemoStore(target_directory)
+        has_existing_file = target_store.file_path.exists()
+        has_current_notes = bool(self.document.notes)
+        if self.storage_directory is None or not has_current_notes:
+            choice = (
+                MemoDirectoryChoiceDialog.READ
+                if has_existing_file
+                else MemoDirectoryChoiceDialog.EMPTY
+            )
+        else:
+            choice = self._ask_directory_choice(
+                target_directory,
+                has_current_notes=has_current_notes,
+                has_existing_file=has_existing_file,
+            )
+        if choice is None:
+            return
+
+        try:
+            if choice == MemoDirectoryChoiceDialog.MIGRATE:
+                target_store.save(self.document)
+                document = self.document
+            elif choice == MemoDirectoryChoiceDialog.READ:
+                document = target_store.load()
+            elif choice == MemoDirectoryChoiceDialog.EMPTY:
+                document = MemoDocument.empty()
+                target_store.save(document)
+            else:
+                return
+        except MemoStoreError as exc:
+            self._show_message("error", "无法更换存储目录", str(exc))
+            return
+
+        self._activate_storage(target_directory, target_store, document)
+        self._show_message("success", "存储目录已更新", str(target_directory))
+
+    def _ask_directory_choice(
+        self,
+        target_directory: Path,
+        *,
+        has_current_notes: bool,
+        has_existing_file: bool,
+    ) -> str | None:
+        dialog = MemoDirectoryChoiceDialog(
+            target_directory,
+            has_current_notes=has_current_notes,
+            has_existing_file=has_existing_file,
+            parent=self.window(),
+        )
+        if not dialog.exec():
+            return None
+        return dialog.selected_choice()
+
+    def reload_storage_directory(self, *_args) -> None:
+        if self.storage_directory is None or self.store is None:
+            self.choose_storage_directory()
+            return
+        if self.storage_ready and self.dirty and not self._save_now():
+            return
+        if not self.storage_directory.exists() or not self.storage_directory.is_dir():
+            self._set_storage_unavailable(
+                "存储目录仍然不可用，请恢复该目录或选择新的文件夹。"
+            )
+            return
+        try:
+            document = self.store.load()
+        except MemoStoreError as exc:
+            self._set_storage_unavailable(str(exc))
+            self._show_message("error", "读取备忘录失败", str(exc))
+            return
+        self._activate_storage(
+            self.storage_directory,
+            self.store,
+            document,
+            persist=False,
+        )
+        self._show_message("success", "重新读取成功", MEMO_FILENAME)
+
+    def open_storage_directory(self, *_args) -> None:
+        if (
+            self.storage_directory is None
+            or not self.storage_directory.exists()
+            or not self.storage_directory.is_dir()
+        ):
+            self._show_message("warning", "目录不可用", "请先选择有效的存储目录。")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.storage_directory))):
+            self._show_message("error", "无法打开目录", str(self.storage_directory))
+
+    def restore_backup(self, *_args) -> None:
+        if self.store is None or not self.store.backup_path.exists():
+            self._show_message("warning", "没有可用备份", "未找到备忘录备份文件。")
+            return
+        dialog = MessageBox(
+            "从备份恢复",
+            "将使用 .bak 文件恢复备忘录。确认继续吗？",
+            self.window(),
+        )
+        dialog.yesButton.setText("恢复")
+        dialog.cancelButton.setText("取消")
+        if not dialog.exec():
+            return
+        try:
+            document = self.store.restore_backup()
+        except MemoStoreError as exc:
+            self._show_message("error", "恢复失败", str(exc))
+            return
+        assert self.storage_directory is not None
+        self._activate_storage(
+            self.storage_directory,
+            self.store,
+            document,
+            persist=False,
+        )
+        self._show_message("success", "备忘录已恢复", self.store.backup_path.name)
+
+    def _visible_notes(self) -> list[MemoNote]:
+        query = self.search_edit.text().strip().casefold()
+        notes = [
+            note
+            for note in self.document.notes
+            if not query
+            or query in note.title.casefold()
+            or query in note.content.casefold()
+        ]
+        notes.sort(key=lambda note: note.updated_at, reverse=True)
+        notes.sort(key=lambda note: not note.pinned)
+        return notes
+
+    @staticmethod
+    def _display_title(note: MemoNote) -> str:
+        title = " ".join(note.title.strip().splitlines()).strip()
+        if not title:
+            title = next(
+                (line.strip() for line in note.content.splitlines() if line.strip()),
+                "无标题备忘录",
+            )
+        return title if len(title) <= 30 else title[:29] + "…"
+
+    @staticmethod
+    def _format_timestamp(value: str) -> str:
+        try:
+            normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone()
+            return parsed.strftime("%Y-%m-%d %H:%M")
+        except (TypeError, ValueError):
+            return value
+
+    def _refresh_note_list(self, preferred_id: str | None = None) -> None:
+        selected_id = preferred_id or self.current_note_id
+        notes = self._visible_notes() if self.storage_ready else []
+        self.refreshing_list = True
+        self.note_list.blockSignals(True)
+        self.note_list.clear()
+        selected_item: QListWidgetItem | None = None
+        for note in notes:
+            item = QListWidgetItem(
+                FIF.PIN.icon() if note.pinned else FIF.QUICK_NOTE.icon(),
+                f"{self._display_title(note)}\n修改于 {self._format_timestamp(note.updated_at)}",
+            )
+            item.setData(Qt.UserRole, note.id)
+            item.setSizeHint(QSize(0, 54))
+            self.note_list.addItem(item)
+            if note.id == selected_id:
+                selected_item = item
+        if selected_item is None and self.note_list.count():
+            selected_item = self.note_list.item(0)
+        self.note_list.setCurrentItem(selected_item)
+        self.note_list.blockSignals(False)
+        self.refreshing_list = False
+
+        self.note_count_label.setText(
+            f"显示 {len(notes)}/{len(self.document.notes)} 条"
+            if self.search_edit.text().strip()
+            else f"共 {len(self.document.notes)} 条"
+        )
+        selected_note_id = (
+            str(selected_item.data(Qt.UserRole)) if selected_item is not None else None
+        )
+        if selected_note_id != self.current_note_id:
+            self._display_note(selected_note_id)
+        elif selected_note_id is None:
+            self._display_note(None)
+        self._update_control_states()
+
+    def _update_current_list_item(self) -> None:
+        note = self._current_note()
+        if note is None:
+            return
+        for index in range(self.note_list.count()):
+            item = self.note_list.item(index)
+            if item.data(Qt.UserRole) == note.id:
+                item.setText(
+                    f"{self._display_title(note)}\n"
+                    f"修改于 {self._format_timestamp(note.updated_at)}"
+                )
+                item.setIcon(FIF.PIN.icon() if note.pinned else FIF.QUICK_NOTE.icon())
+                return
+
+    def _current_note(self) -> MemoNote | None:
+        if self.current_note_id is None:
+            return None
+        try:
+            return find_note(self.document, self.current_note_id)
+        except MemoStoreError:
+            return None
+
+    def _on_note_selected(
+        self,
+        current: QListWidgetItem | None,
+        _previous: QListWidgetItem | None,
+    ) -> None:
+        if self.refreshing_list:
+            return
+        if self.dirty:
+            self._save_now()
+        note_id = str(current.data(Qt.UserRole)) if current is not None else None
+        self._display_note(note_id)
+
+    def _display_note(self, note_id: str | None) -> None:
+        note: MemoNote | None = None
+        if note_id is not None:
+            try:
+                note = find_note(self.document, note_id)
+            except MemoStoreError:
+                note = None
+        self.current_note_id = note.id if note is not None else None
+        self.loading_editor = True
+        try:
+            self.title_edit.setText(note.title if note is not None else "")
+            self.content_edit.setPlainText(note.content if note is not None else "")
+        finally:
+            self.loading_editor = False
+        if note is None:
+            self.note_metadata_label.setText(
+                "请先在设置中配置存储目录"
+                if not self.storage_ready
+                else "请选择或新建备忘录"
+            )
+            self.save_status_label.setText("")
+        else:
+            self.note_metadata_label.setText(
+                "创建于 "
+                f"{self._format_timestamp(note.created_at)}    "
+                "修改于 "
+                f"{self._format_timestamp(note.updated_at)}"
+            )
+            self.save_status_label.setText("已保存")
+        self._update_control_states()
+
+    def _on_search_changed(self, *_args) -> None:
+        if self.dirty:
+            self._save_now()
+        self._refresh_note_list(preferred_id=self.current_note_id)
+
+    def _on_editor_changed(self, *_args) -> None:
+        if self.loading_editor:
+            return
+        note = self._current_note()
+        if note is None:
+            return
+        update_note(
+            self.document,
+            note.id,
+            title=self.title_edit.text(),
+            content=self.content_edit.toPlainText(),
+        )
+        self.dirty = True
+        self.last_save_error = ""
+        self.save_timer.start()
+        self.save_status_label.setText("等待自动保存…")
+        self.note_metadata_label.setText(
+            "创建于 "
+            f"{self._format_timestamp(note.created_at)}    "
+            "修改于 "
+            f"{self._format_timestamp(note.updated_at)}"
+        )
+        self._update_current_list_item()
+        self._update_control_states()
+
+    def _create_note(self, *_args) -> None:
+        if not self.storage_ready:
+            self._show_message(
+                "warning",
+                "尚未配置存储目录",
+                "请先前往“设置”选择备忘录存储目录。",
+            )
+            return
+        if self.dirty:
+            self._save_now()
+        note = create_note(self.document, title="未命名备忘录")
+        self.current_note_id = note.id
+        self.dirty = True
+        self._save_now()
+        self._refresh_note_list(preferred_id=note.id)
+        self.title_edit.setFocus()
+        self.title_edit.selectAll()
+
+    def _toggle_pin(self, *_args) -> None:
+        note = self._current_note()
+        if note is None:
+            return
+        if self.dirty:
+            self._save_now()
+        set_note_pinned(self.document, note.id, not note.pinned)
+        self.dirty = True
+        self._save_now()
+        self._refresh_note_list(preferred_id=note.id)
+
+    def _delete_current_note(self, *_args) -> None:
+        note = self._current_note()
+        if note is None:
+            return
+        if self.dirty:
+            self._save_now()
+        title = self._display_title(note)
+        dialog = MessageBox(
+            "删除备忘录",
+            f"确定删除“{title}”吗？此操作会立即写入 JSON 文件。",
+            self.window(),
+        )
+        dialog.yesButton.setText("删除")
+        dialog.cancelButton.setText("取消")
+        if not dialog.exec():
+            return
+        delete_note(self.document, note.id)
+        self.current_note_id = None
+        self.dirty = True
+        self._save_now()
+        self._refresh_note_list()
+        self._show_message("success", "已删除备忘录", title)
+
+    def _copy_current_content(self, *_args) -> None:
+        note = self._current_note()
+        if note is None or not note.content:
+            return
+        QApplication.clipboard().setText(note.content)
+        self._show_message("success", "复制成功", "备忘录正文已复制到剪贴板。")
+
+    def _copy_current_full_text(self, *_args) -> None:
+        note = self._current_note()
+        if note is None:
+            return
+        if note.title and note.content:
+            text = f"{note.title}\n\n{note.content}"
+        else:
+            text = note.title or note.content
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        self._show_message("success", "复制成功", "标题和正文已复制到剪贴板。")
+
+    def _save_now(self) -> bool:
+        self.save_timer.stop()
+        if not self.dirty:
+            return True
+        if not self.storage_ready or self.store is None:
+            self.last_save_error = "备忘录存储目录不可用，当前修改尚未保存。"
+            self.save_status_label.setText("保存失败")
+            return False
+        try:
+            self.store.save(self.document)
+        except MemoStoreError as exc:
+            self.last_save_error = str(exc)
+            self.save_status_label.setText("保存失败，请检查存储目录")
+            self._show_storage_message(str(exc), error=True)
+            self.storage_state_changed.emit()
+            return False
+        self.dirty = False
+        self.last_save_error = ""
+        self.save_status_label.setText("已自动保存")
+        self._clear_storage_message()
+        self.storage_state_changed.emit()
+        return True
+
+    def _update_control_states(self) -> None:
+        note = self._current_note()
+        has_note = note is not None
+        self.search_edit.setEnabled(self.storage_ready)
+        self.new_note_button.setEnabled(self.storage_ready)
+        self.note_list.setEnabled(self.storage_ready)
+        self.title_edit.setEnabled(self.storage_ready and has_note)
+        self.content_edit.setEnabled(self.storage_ready and has_note)
+        self.pin_button.setEnabled(self.storage_ready and has_note)
+        self.delete_note_button.setEnabled(self.storage_ready and has_note)
+        if note is None:
+            self.pin_button.setText("置顶")
+            self.pin_button.setIcon(FIF.PIN)
+        elif note.pinned:
+            self.pin_button.setText("取消置顶")
+            self.pin_button.setIcon(FIF.UNPIN)
+        else:
+            self.pin_button.setText("置顶")
+            self.pin_button.setIcon(FIF.PIN)
+        self.copy_button.button.setEnabled(has_note and bool(note.content))
+        self.copy_full_action.setEnabled(
+            has_note and bool(note.title or note.content)
+        )
+        self.character_count_label.setText(
+            f"{len(note.content) if note is not None else 0} 个字符"
+        )
+
+    def _show_message(self, level: str, title: str, content: str) -> None:
+        kwargs = dict(
+            title=title,
+            content=content,
+            duration=2200,
+            position=InfoBarPosition.TOP_RIGHT,
+            parent=self.window(),
+        )
+        if level == "success":
+            InfoBar.success(**kwargs)
+        elif level == "error":
+            InfoBar.error(**kwargs)
+        elif level == "warning":
+            InfoBar.warning(**kwargs)
+        else:
+            InfoBar.info(**kwargs)
+
+    def prepare_close(self) -> bool:
+        return self._save_now()
+
+    def apply_theme_styles(self) -> None:
+        apply_background(self, theme_colors()["page"])
+        self.setStyleSheet(theme_stylesheet())
+
+
 class SettingsPage(QWidget):
     def __init__(
         self,
@@ -2786,6 +3854,7 @@ class SettingsPage(QWidget):
         on_feature_changed,
         comprehensive_feature_states: dict[str, bool],
         on_comprehensive_feature_changed,
+        memo_page: MemoPage,
     ) -> None:
         super().__init__()
         self.setObjectName("settingsPage")
@@ -2793,14 +3862,31 @@ class SettingsPage(QWidget):
         self.on_theme_changed = on_theme_changed
         self.on_feature_changed = on_feature_changed
         self.on_comprehensive_feature_changed = on_comprehensive_feature_changed
+        self.memo_page = memo_page
         self.feature_switches: dict[str, SwitchButton] = {}
         self.comprehensive_feature_switches: dict[str, SwitchButton] = {}
 
-        root_layout = QVBoxLayout(self)
+        page_layout = QVBoxLayout(self)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.scroll_area = SmoothScrollArea(self)
+        self.scroll_area.setObjectName("PageScrollArea")
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.NoFrame)
+        self.scroll_area.viewport().setObjectName("PageViewport")
+        self.scroll_area.viewport().setAttribute(Qt.WA_StyledBackground, True)
+        page_layout.addWidget(self.scroll_area)
+
+        self.content_widget = QWidget(self)
+        self.content_widget.setObjectName("PageContainer")
+        self.content_widget.setAttribute(Qt.WA_StyledBackground, True)
+        self.scroll_area.setWidget(self.content_widget)
+
+        root_layout = QVBoxLayout(self.content_widget)
         root_layout.setContentsMargins(28, 24, 28, 28)
         root_layout.setSpacing(14)
 
-        title = QLabel("设置", self)
+        title = QLabel("设置", self.content_widget)
         title.setObjectName("TitleLabel")
         root_layout.addWidget(title)
 
@@ -2825,7 +3911,11 @@ class SettingsPage(QWidget):
         theme_row.addStretch(1)
         card_layout.addLayout(theme_row)
 
-        root_layout.addWidget(card)
+        top_cards = QHBoxLayout()
+        top_cards.setSpacing(14)
+        top_cards.addWidget(card, 1)
+        top_cards.addWidget(self._build_memo_storage_card(), 2)
+        root_layout.addLayout(top_cards)
 
         switch_cards = QHBoxLayout()
         switch_cards.setSpacing(14)
@@ -2866,7 +3956,125 @@ class SettingsPage(QWidget):
                     checked,
                 )
             )
+        self.memo_page.storage_state_changed.connect(
+            self._refresh_memo_storage_state
+        )
         self.apply_theme_styles()
+
+    def _build_memo_storage_card(self) -> CardWidget:
+        card = CardWidget(self)
+        card.setObjectName("PanelCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+
+        title_label = QLabel("备忘录存储", card)
+        title_label.setObjectName("SectionTitle")
+        layout.addWidget(title_label)
+
+        hint_label = QLabel(
+            "备忘录固定保存为本地 JSON；存储目录只在这里管理。",
+            card,
+        )
+        hint_label.setObjectName("MutedLabel")
+        hint_label.setWordWrap(True)
+        layout.addWidget(hint_label)
+
+        directory_row = QHBoxLayout()
+        directory_row.setSpacing(8)
+        self.memo_directory_path_edit = LineEdit(card)
+        self.memo_directory_path_edit.setReadOnly(True)
+        self.memo_directory_path_edit.setPlaceholderText("尚未选择存储目录")
+        self.memo_directory_path_edit.setSizePolicy(
+            QSizePolicy.Ignored,
+            QSizePolicy.Fixed,
+        )
+        self.memo_directory_path_edit.setMinimumWidth(0)
+        self.memo_choose_directory_button = PrimaryPushButton("选择目录", card)
+        self.memo_choose_directory_button.setIcon(FIF.FOLDER_ADD)
+        directory_row.addWidget(self.memo_directory_path_edit, 1)
+        directory_row.addWidget(self.memo_choose_directory_button)
+        layout.addLayout(directory_row)
+
+        self.memo_storage_status_label = QLabel("", card)
+        self.memo_storage_status_label.setObjectName("MutedLabel")
+        self.memo_storage_status_label.setWordWrap(True)
+        layout.addWidget(self.memo_storage_status_label)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        self.memo_reload_directory_button = PushButton("重新读取", card)
+        self.memo_reload_directory_button.setIcon(FIF.SYNC)
+        self.memo_open_directory_button = PushButton("打开目录", card)
+        self.memo_open_directory_button.setIcon(FIF.FOLDER)
+        self.memo_restore_backup_button = PushButton("从备份恢复", card)
+        self.memo_restore_backup_button.setIcon(FIF.HISTORY)
+        action_row.addWidget(self.memo_reload_directory_button)
+        action_row.addWidget(self.memo_open_directory_button)
+        action_row.addWidget(self.memo_restore_backup_button)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
+
+        self.memo_choose_directory_button.clicked.connect(
+            self.memo_page.choose_storage_directory
+        )
+        self.memo_reload_directory_button.clicked.connect(
+            self.memo_page.reload_storage_directory
+        )
+        self.memo_open_directory_button.clicked.connect(
+            self.memo_page.open_storage_directory
+        )
+        self.memo_restore_backup_button.clicked.connect(
+            self.memo_page.restore_backup
+        )
+        return card
+
+    def _refresh_memo_storage_state(self) -> None:
+        directory = self.memo_page.storage_directory
+        directory_text = str(directory) if directory is not None else ""
+        self.memo_directory_path_edit.setText(directory_text)
+        self.memo_directory_path_edit.setToolTip(directory_text)
+        self.memo_choose_directory_button.setText(
+            "更改目录" if directory is not None else "选择目录"
+        )
+
+        if self.memo_page.storage_message:
+            status_text = self.memo_page.storage_message
+            status_is_error = self.memo_page.storage_message_is_error
+        elif self.memo_page.storage_ready:
+            status_text = f"存储正常 · 数据文件：{MEMO_FILENAME}"
+            status_is_error = False
+        elif directory is not None:
+            status_text = "当前存储目录不可用，请恢复目录或重新选择。"
+            status_is_error = True
+        else:
+            status_text = "尚未配置，请选择一个本地文件夹。"
+            status_is_error = False
+
+        self.memo_storage_status_label.setText(status_text)
+        self.memo_storage_status_label.setToolTip(status_text)
+        self.memo_storage_status_label.setObjectName(
+            "ErrorLabel" if status_is_error else "MutedLabel"
+        )
+        self.memo_storage_status_label.style().unpolish(
+            self.memo_storage_status_label
+        )
+        self.memo_storage_status_label.style().polish(
+            self.memo_storage_status_label
+        )
+
+        has_directory = directory is not None
+        directory_available = bool(
+            directory is not None and directory.exists() and directory.is_dir()
+        )
+        has_backup = bool(
+            self.memo_page.store is not None
+            and self.memo_page.store.backup_path.exists()
+        )
+        self.memo_reload_directory_button.setEnabled(has_directory)
+        self.memo_open_directory_button.setEnabled(directory_available)
+        self.memo_restore_backup_button.setVisible(has_backup)
+        self.memo_restore_backup_button.setEnabled(has_backup)
 
     def _build_switch_card(
         self,
@@ -2911,7 +4119,10 @@ class SettingsPage(QWidget):
 
     def apply_theme_styles(self) -> None:
         apply_background(self, theme_colors()["page"])
+        apply_background(self.content_widget, theme_colors()["page"])
+        apply_background(self.scroll_area.viewport(), theme_colors()["page"])
         self.setStyleSheet(theme_stylesheet())
+        self._refresh_memo_storage_state()
 
     def _theme_changed(self, label: str) -> None:
         self.on_theme_changed(THEME_LABELS.get(label, "light"))
@@ -2963,6 +4174,30 @@ class AboutActionButton(PushButton):
             event.accept()
             return
         super().keyReleaseEvent(event)
+
+
+class OpenSourceLicenseDialog(MessageBoxBase):
+    def __init__(self, license_text: str, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.widget.setMinimumWidth(720)
+
+        title_label = SubtitleLabel("开源字体许可", self.widget)
+        summary_label = BodyLabel(
+            f"{REFERENCE_NOTICE_FONT_NAME} · Adobe Source Han Sans · "
+            "SIL Open Font License 1.1",
+            self.widget,
+        )
+        summary_label.setWordWrap(True)
+        self.license_text_edit = PlainTextEdit(self.widget)
+        self.license_text_edit.setReadOnly(True)
+        self.license_text_edit.setPlainText(license_text)
+        self.license_text_edit.setMinimumHeight(360)
+
+        self.viewLayout.addWidget(title_label)
+        self.viewLayout.addWidget(summary_label)
+        self.viewLayout.addWidget(self.license_text_edit)
+        self.yesButton.setText("关闭")
+        self.cancelButton.hide()
 
 
 class AboutPage(QWidget):
@@ -3031,10 +4266,28 @@ class AboutPage(QWidget):
         self.privacy_lead_label.setObjectName("AboutPrivacyLead")
         self.no_overwrite_label = QLabel("输出文件不会覆盖原图", self.about_panel)
         self.no_path_storage_label = QLabel("不保存图片名称或路径", self.about_panel)
+        self.memo_storage_label = QLabel(
+            "备忘录仅保存在用户指定的本地目录",
+            self.about_panel,
+        )
+        font_license_row = QHBoxLayout()
+        font_license_row.setSpacing(10)
+        self.font_license_label = QLabel(
+            f"参考图提示字体：{REFERENCE_NOTICE_FONT_NAME} · Adobe · SIL OFL 1.1",
+            self.about_panel,
+        )
+        self.font_license_label.setObjectName("MutedLabel")
+        self.font_license_button = PushButton("查看开源许可", self.about_panel)
+        self.font_license_button.setIcon(FIF.DOCUMENT)
+        font_license_row.addWidget(self.font_license_label)
+        font_license_row.addStretch(1)
+        font_license_row.addWidget(self.font_license_button)
         panel_layout.addWidget(self.privacy_title_label)
         panel_layout.addWidget(self.privacy_lead_label)
         panel_layout.addWidget(self.no_overwrite_label)
         panel_layout.addWidget(self.no_path_storage_label)
+        panel_layout.addWidget(self.memo_storage_label)
+        panel_layout.addLayout(font_license_row)
 
         self.divider = QFrame(self.about_panel)
         self.divider.setObjectName("AboutDivider")
@@ -3111,6 +4364,7 @@ class AboutPage(QWidget):
             lambda: self._open_external_url(PROJECT_ISSUES_URL)
         )
         self.copy_version_action.clicked.connect(self._copy_version_information)
+        self.font_license_button.clicked.connect(self._show_font_license)
         self.apply_theme_styles()
 
     @staticmethod
@@ -3125,6 +4379,18 @@ class AboutPage(QWidget):
     def _copy_version_information(self) -> None:
         QApplication.clipboard().setText(self.version_information_text())
         self._show_message("success", "版本信息已复制")
+
+    def _show_font_license(self) -> None:
+        license_path = resource_path(REFERENCE_NOTICE_LICENSE_RELATIVE_PATH)
+        try:
+            license_text = license_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            self._show_message("error", "开源字体许可证文件缺失")
+            return
+        except (OSError, UnicodeError):
+            self._show_message("error", "开源字体许可证文件无法读取")
+            return
+        OpenSourceLicenseDialog(license_text, self.window()).exec()
 
     def _show_message(self, level: str, content: str) -> None:
         kwargs = dict(
@@ -3184,6 +4450,12 @@ class ImageToolWindow(FluentWindow):
         self.compress_page = ImageOperationPage("图片压缩", MODE_COMPRESS, "compressPage")
         self.logo_page = ImageOperationPage("LOGO叠加", MODE_LOGO, "logoPage")
         self.watermark_page = ImageOperationPage("水印", MODE_WATERMARK, "watermarkPage")
+        self.reference_notice_page = ImageOperationPage(
+            "参考图提示",
+            MODE_REFERENCE_NOTICE,
+            "referenceNoticePage",
+        )
+        self.memo_page = MemoPage(self.settings)
         self.settings_page = SettingsPage(
             self.theme_value,
             self._set_theme_mode,
@@ -3191,6 +4463,7 @@ class ImageToolWindow(FluentWindow):
             self._set_feature_enabled,
             self.comprehensive_feature_states,
             self._set_comprehensive_feature_enabled,
+            self.memo_page,
         )
         self.about_page = AboutPage()
         self.feature_pages = {
@@ -3200,6 +4473,8 @@ class ImageToolWindow(FluentWindow):
             MODE_COMPRESS: self.compress_page,
             MODE_LOGO: self.logo_page,
             MODE_WATERMARK: self.watermark_page,
+            MODE_REFERENCE_NOTICE: self.reference_notice_page,
+            MODE_MEMO: self.memo_page,
         }
         self.operation_pages = [
             self.comprehensive_page,
@@ -3208,9 +4483,11 @@ class ImageToolWindow(FluentWindow):
             self.compress_page,
             self.logo_page,
             self.watermark_page,
+            self.reference_notice_page,
         ]
         self.theme_pages = [
             *self.operation_pages,
+            self.memo_page,
             self.settings_page,
             self.about_page,
         ]
@@ -3228,6 +4505,8 @@ class ImageToolWindow(FluentWindow):
             (MODE_COMPRESS, self.compress_page, FIF.ZIP_FOLDER),
             (MODE_LOGO, self.logo_page, FIF.EDIT),
             (MODE_WATERMARK, self.watermark_page, FIF.TAG),
+            (MODE_REFERENCE_NOTICE, self.reference_notice_page, FIF.LABEL),
+            (MODE_MEMO, self.memo_page, FIF.QUICK_NOTE),
         )
         self.feature_nav_items = {}
         for feature, page, icon in feature_navigation:
@@ -3282,6 +4561,24 @@ class ImageToolWindow(FluentWindow):
         self.move(frame_geometry.topLeft())
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if not self.memo_page.prepare_close():
+            dialog = MessageBox(
+                "备忘录尚未保存",
+                self.memo_page.last_save_error
+                or "备忘录仍有未保存的修改。是否仍然退出？",
+                self,
+            )
+            dialog.yesButton.setText("仍然退出")
+            dialog.cancelButton.setText("返回备忘录")
+            if not dialog.exec():
+                memo_switch = self.settings_page.feature_switches[MODE_MEMO]
+                memo_switch.blockSignals(True)
+                memo_switch.setChecked(True)
+                memo_switch.blockSignals(False)
+                self._set_feature_enabled(MODE_MEMO, True)
+                self.switchTo(self.memo_page)
+                event.ignore()
+                return
         for page in self.operation_pages:
             page.shutdown()
         # Flush queued per-image completion signals after workers have stopped,
@@ -3309,6 +4606,23 @@ class ImageToolWindow(FluentWindow):
         ensure_current: bool = True,
     ) -> None:
         if feature not in self.feature_pages:
+            return
+
+        if (
+            feature == MODE_MEMO
+            and not enabled
+            and persist
+            and not self.memo_page.prepare_close()
+        ):
+            memo_switch = self.settings_page.feature_switches[MODE_MEMO]
+            memo_switch.blockSignals(True)
+            memo_switch.setChecked(True)
+            memo_switch.blockSignals(False)
+            self.memo_page._show_message(
+                "error",
+                "备忘录尚未保存",
+                self.memo_page.last_save_error,
+            )
             return
 
         enabled = bool(enabled)

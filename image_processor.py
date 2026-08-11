@@ -1,17 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
+from math import cos, pi, sin
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
 from compressor import CompressionResult, save_image_to_bytes
 from config import (
+    DEFAULT_REFERENCE_NOTICE_BACKGROUND_OPACITY,
+    DEFAULT_REFERENCE_NOTICE_POSITION,
     MAX_OUTPUT_DIMENSION,
     MAX_OUTPUT_PIXELS,
     MAX_MANUAL_QUALITY,
+    MAX_REFERENCE_NOTICE_TEXT_LENGTH,
     MIN_MANUAL_QUALITY,
+    REFERENCE_NOTICE_POSITIONS,
+    REFERENCE_NOTICE_POSITION_BOTTOM_LEFT,
+    REFERENCE_NOTICE_POSITION_BOTTOM_RIGHT,
+    REFERENCE_NOTICE_POSITION_TOP_LEFT,
+    REFERENCE_NOTICE_POSITION_TOP_RIGHT,
     WATERMARK_POSITION_CUSTOM,
     WATERMARK_POSITION_TILE,
     WATERMARK_TYPE_IMAGE,
@@ -51,6 +60,48 @@ class WatermarkOptions:
 
 
 @dataclass(frozen=True)
+class ReferenceNoticeOptions:
+    text: str
+    font_path: str | Path
+    font_size: int = 0
+    background_opacity: int = DEFAULT_REFERENCE_NOTICE_BACKGROUND_OPACITY
+    position: str = DEFAULT_REFERENCE_NOTICE_POSITION
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise ValueError("reference notice text cannot be empty")
+        if len(self.text) > MAX_REFERENCE_NOTICE_TEXT_LENGTH:
+            raise ValueError(
+                "reference notice text cannot exceed "
+                f"{MAX_REFERENCE_NOTICE_TEXT_LENGTH} characters"
+            )
+
+        if (
+            isinstance(self.font_size, bool)
+            or not isinstance(self.font_size, int)
+            or not (self.font_size == 0 or 1 <= self.font_size <= 500)
+        ):
+            raise ValueError("reference notice font_size must be 0 or between 1 and 500")
+
+        if (
+            isinstance(self.background_opacity, bool)
+            or not isinstance(self.background_opacity, int)
+            or not 1 <= self.background_opacity <= 100
+        ):
+            raise ValueError("reference notice background_opacity must be between 1 and 100")
+
+        if self.position not in REFERENCE_NOTICE_POSITIONS:
+            raise ValueError("reference notice position is invalid")
+
+        try:
+            font_path = Path(self.font_path)
+        except TypeError as exc:
+            raise ValueError("reference notice font_path must be a file path") from exc
+        if not font_path.is_file():
+            raise ValueError(f"参考图提示字体文件不存在：{font_path}")
+
+
+@dataclass(frozen=True)
 class ProcessOptions:
     output_format: str
     output_size: tuple[int, int] | None
@@ -58,6 +109,7 @@ class ProcessOptions:
     logos: list[Image.Image]
     watermark_options: WatermarkOptions | None = None
     quality: int | None = None
+    reference_notice_options: ReferenceNoticeOptions | None = None
 
     def __post_init__(self) -> None:
         if self.output_size is not None:
@@ -151,8 +203,22 @@ def _render_working_image(source_path: str | Path, options: ProcessOptions) -> I
             raise RuntimeError("内置LOGO加载失败")
         working = overlay_logos(working, options.logos)
 
-    if options.watermark_options is not None:
-        working = apply_watermark(working, options.watermark_options)
+    watermark_options = options.watermark_options
+    if (
+        watermark_options is not None
+        and options.reference_notice_options is not None
+    ):
+        watermark_options, _ = resolve_watermark_options_for_reference_notice(
+            working.size,
+            watermark_options,
+            options.reference_notice_options,
+        )
+
+    if watermark_options is not None:
+        working = apply_watermark(working, watermark_options)
+
+    if options.reference_notice_options is not None:
+        working = apply_reference_notice(working, options.reference_notice_options)
 
     return working
 
@@ -222,6 +288,154 @@ def create_watermark_layer(base_size: tuple[int, int], options: WatermarkOptions
     return _rotate_layer(layer, options.angle)
 
 
+def resolve_watermark_options_for_reference_notice(
+    base_size: tuple[int, int],
+    watermark_options: WatermarkOptions,
+    notice_options: ReferenceNoticeOptions,
+) -> tuple[WatermarkOptions, bool]:
+    if watermark_options.position != notice_options.position:
+        return watermark_options, False
+
+    reference_layer = create_reference_notice_layer(base_size, notice_options)
+    notice_font_size = _reference_notice_font_size(
+        base_size,
+        notice_options.font_size,
+    )
+    gap = min(
+        max(8, notice_font_size // 2),
+        max(1, reference_layer.height // 2),
+    )
+    watermark_margin = max(0, watermark_options.margin)
+    if notice_options.position in {
+        REFERENCE_NOTICE_POSITION_BOTTOM_LEFT,
+        REFERENCE_NOTICE_POSITION_BOTTOM_RIGHT,
+    }:
+        highest_safe_offset_y = watermark_margin - reference_layer.height - gap
+        if watermark_options.offset_y <= highest_safe_offset_y:
+            return watermark_options, False
+        minimum_visible_offset_y = watermark_margin - base_size[1] + 1
+        adjusted_offset_y = min(
+            watermark_options.offset_y,
+            max(highest_safe_offset_y, minimum_visible_offset_y),
+        )
+    else:
+        lowest_safe_offset_y = reference_layer.height + gap - watermark_margin
+        if watermark_options.offset_y >= lowest_safe_offset_y:
+            return watermark_options, False
+        maximum_visible_offset_y = base_size[1] - watermark_margin - 1
+        adjusted_offset_y = max(
+            watermark_options.offset_y,
+            min(lowest_safe_offset_y, maximum_visible_offset_y),
+        )
+    if adjusted_offset_y == watermark_options.offset_y:
+        return watermark_options, False
+    return replace(watermark_options, offset_y=adjusted_offset_y), True
+
+
+def apply_reference_notice(
+    image: Image.Image,
+    options: ReferenceNoticeOptions,
+    *,
+    layer: Image.Image | None = None,
+) -> Image.Image:
+    base = image.convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    if layer is None:
+        layer = create_reference_notice_layer(base.size, options)
+    x, y = reference_notice_position_for_layer(
+        base.size,
+        layer.size,
+        options.position,
+    )
+    _alpha_composite_clipped(overlay, layer, x, y)
+
+    rendered = Image.alpha_composite(base, overlay)
+    return rendered.convert("RGBA") if _has_alpha(image) else rendered.convert("RGB")
+
+
+def create_reference_notice_layer(
+    base_size: tuple[int, int],
+    options: ReferenceNoticeOptions,
+) -> Image.Image:
+    try:
+        width, height = base_size
+    except (TypeError, ValueError) as exc:
+        raise ValueError("base_size must contain width and height") from exc
+    if (
+        isinstance(width, bool)
+        or isinstance(height, bool)
+        or not isinstance(width, int)
+        or not isinstance(height, int)
+        or width <= 0
+        or height <= 0
+    ):
+        raise ValueError("base dimensions must be positive integers")
+    text = options.text.strip()
+    requested_font_size = _reference_notice_font_size(
+        (width, height),
+        options.font_size,
+    )
+    (
+        font,
+        font_size,
+        line_spacing,
+        bbox,
+        text_width,
+        text_height,
+        padding_x,
+        padding_y,
+    ) = _fit_reference_notice_text(
+        (width, height),
+        text,
+        options.font_path,
+        requested_font_size,
+    )
+    layer_width = min(width, text_width + padding_x * 2)
+    layer_height = min(height, text_height + padding_y * 2)
+    draw_padding_x = min(padding_x, max(0, (layer_width - text_width) // 2))
+    draw_padding_y = min(padding_y, max(0, (layer_height - text_height) // 2))
+    radius = min(
+        max(1, round(layer_height * 0.48)),
+        layer_width // 2,
+        layer_height // 2,
+    )
+
+    layer = Image.new("RGBA", (layer_width, layer_height), (0, 0, 0, 0))
+    _draw_reference_notice_background(
+        layer,
+        radius,
+        options.position,
+        (24, 24, 24, _opacity_to_alpha(options.background_opacity)),
+    )
+    layer_draw = ImageDraw.Draw(layer)
+    layer_draw.multiline_text(
+        (draw_padding_x - bbox[0], draw_padding_y - bbox[1]),
+        text,
+        font=font,
+        fill=(255, 255, 255, 255),
+        spacing=line_spacing,
+    )
+    return layer
+
+
+def reference_notice_position_for_layer(
+    base_size: tuple[int, int],
+    layer_size: tuple[int, int],
+    position: str,
+) -> tuple[int, int]:
+    if position not in REFERENCE_NOTICE_POSITIONS:
+        raise ValueError("reference notice position is invalid")
+    x = 0 if position in {
+        REFERENCE_NOTICE_POSITION_TOP_LEFT,
+        REFERENCE_NOTICE_POSITION_BOTTOM_LEFT,
+    } else base_size[0] - layer_size[0]
+    y = 0 if position in {
+        REFERENCE_NOTICE_POSITION_TOP_LEFT,
+        REFERENCE_NOTICE_POSITION_TOP_RIGHT,
+    } else base_size[1] - layer_size[1]
+    return x, y
+
+
 def watermark_position_for_layer(
     base_size: tuple[int, int],
     layer_size: tuple[int, int],
@@ -286,6 +500,136 @@ def _load_watermark_font(font_size: int) -> ImageFont.ImageFont:
         except OSError:
             continue
     return ImageFont.load_default()
+
+
+def _reference_notice_font_size(base_size: tuple[int, int], requested_size: int) -> int:
+    if requested_size > 0:
+        return requested_size
+    return max(16, min(64, round(min(base_size) * 0.025)))
+
+
+def _fit_reference_notice_text(
+    base_size: tuple[int, int],
+    text: str,
+    font_path: str | Path,
+    requested_font_size: int,
+) -> tuple[
+    ImageFont.FreeTypeFont,
+    int,
+    int,
+    tuple[int, int, int, int],
+    int,
+    int,
+    int,
+    int,
+]:
+    width, height = base_size
+    scratch = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(scratch)
+    font_size = requested_font_size
+
+    while True:
+        font = _load_reference_notice_font(font_path, font_size)
+        line_spacing = max(1, round(font_size * 0.2))
+        bbox = draw.multiline_textbbox(
+            (0, 0),
+            text,
+            font=font,
+            spacing=line_spacing,
+        )
+        text_width = max(1, bbox[2] - bbox[0])
+        text_height = max(1, bbox[3] - bbox[1])
+        if font_size >= 16:
+            padding_x = max(8, round(font_size * 0.5))
+            padding_y = max(5, round(font_size * 0.28))
+        else:
+            padding_x = max(1, round(font_size * 0.5))
+            padding_y = max(1, round(font_size * 0.28))
+
+        natural_width = text_width + padding_x * 2
+        natural_height = text_height + padding_y * 2
+        if (natural_width <= width and natural_height <= height) or font_size == 1:
+            return (
+                font,
+                font_size,
+                line_spacing,
+                bbox,
+                text_width,
+                text_height,
+                padding_x,
+                padding_y,
+            )
+
+        scale = min(width / natural_width, height / natural_height)
+        font_size = max(1, min(font_size - 1, int(font_size * scale)))
+
+
+def _draw_reference_notice_background(
+    layer: Image.Image,
+    radius: int,
+    position: str,
+    fill: tuple[int, int, int, int],
+) -> None:
+    mask = _create_reference_notice_squircle_mask(layer.size, radius, position)
+    alpha = mask.point([value * fill[3] // 255 for value in range(256)])
+    layer.paste((*fill[:3], 0), (0, 0, layer.width, layer.height))
+    layer.putalpha(alpha)
+
+
+def _create_reference_notice_squircle_mask(
+    size: tuple[int, int],
+    radius: int,
+    position: str,
+) -> Image.Image:
+    """Create a single-corner n=4 superellipse mask with continuous side tangency."""
+    width, height = size
+    mask = Image.new("L", size, 255)
+    if radius <= 0:
+        return mask
+
+    scale = min(4, max(1, 1024 // radius))
+    high_side = radius * scale
+    extent = high_side - 1
+    corner = Image.new("L", (high_side, high_side), 0)
+    corner_draw = ImageDraw.Draw(corner)
+    steps = max(24, min(512, high_side))
+    curve_power = 2 / 4  # Lamé exponent n=4 (a squircle), not a circular n=2 arc.
+    curve: list[tuple[float, float]] = []
+    for index in range(steps + 1):
+        theta = (pi / 2) * (1 - index / steps)
+        x = extent * (1 - cos(theta) ** curve_power)
+        y = extent * (1 - sin(theta) ** curve_power)
+        curve.append((x, y))
+    corner_draw.polygon([*curve, (extent, extent)], fill=255)
+    if scale > 1:
+        corner = corner.resize((radius, radius), Image.Resampling.LANCZOS)
+
+    if position == REFERENCE_NOTICE_POSITION_BOTTOM_RIGHT:
+        corner_x, corner_y = 0, 0
+    elif position == REFERENCE_NOTICE_POSITION_BOTTOM_LEFT:
+        corner = corner.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        corner_x, corner_y = width - radius, 0
+    elif position == REFERENCE_NOTICE_POSITION_TOP_RIGHT:
+        corner = corner.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+        corner_x, corner_y = 0, height - radius
+    else:
+        corner = corner.transpose(Image.Transpose.ROTATE_180)
+        corner_x, corner_y = width - radius, height - radius
+    mask.paste(corner, (corner_x, corner_y))
+    return mask
+
+
+def _load_reference_notice_font(
+    font_path: str | Path,
+    font_size: int,
+) -> ImageFont.FreeTypeFont:
+    path = Path(font_path)
+    if not path.is_file():
+        raise RuntimeError(f"参考图提示字体文件不存在：{path}")
+    try:
+        return ImageFont.truetype(str(path), font_size)
+    except OSError as exc:
+        raise RuntimeError(f"参考图提示字体无法加载：{path}") from exc
 
 
 def _rotate_layer(layer: Image.Image, angle: int) -> Image.Image:

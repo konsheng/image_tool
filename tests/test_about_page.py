@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -19,8 +21,14 @@ from config import (
     PROJECT_ISSUES_URL,
     PROJECT_RELEASES_URL,
     PROJECT_URL,
+    REFERENCE_NOTICE_FONT_NAME,
 )
-from gui import ABOUT_CONTENT_MAX_WIDTH, AboutActionButton, AboutPage
+from gui import (
+    ABOUT_CONTENT_MAX_WIDTH,
+    AboutActionButton,
+    AboutPage,
+    OpenSourceLicenseDialog,
+)
 
 
 class AboutPageTestCase(unittest.TestCase):
@@ -58,6 +66,14 @@ class AboutPageTestCase(unittest.TestCase):
             self.assertEqual(page.privacy_lead_label.text(), "所有图片均在本机完成处理")
             self.assertEqual(page.no_overwrite_label.text(), "输出文件不会覆盖原图")
             self.assertEqual(page.no_path_storage_label.text(), "不保存图片名称或路径")
+            self.assertEqual(
+                page.memo_storage_label.text(),
+                "备忘录仅保存在用户指定的本地目录",
+            )
+            self.assertEqual(
+                page.font_license_label.text(),
+                f"参考图提示字体：{REFERENCE_NOTICE_FONT_NAME} · Adobe · SIL OFL 1.1",
+            )
             self.assertEqual(page.support_title_label.text(), "帮助与支持")
             self.assertEqual(
                 page.footer_label.text(),
@@ -188,6 +204,50 @@ class AboutPageTestCase(unittest.TestCase):
                 f"{APP_NAME} {APP_VERSION}\n作者：{APP_AUTHOR}",
             )
             show_message.assert_called_once_with("success", "版本信息已复制")
+        finally:
+            self.close_page(page)
+
+    def test_bundled_font_license_is_available_from_about_page(self) -> None:
+        page = self.make_page()
+        try:
+            with patch("gui.OpenSourceLicenseDialog") as dialog_class:
+                QTest.mouseClick(page.font_license_button, Qt.LeftButton)
+                self.process_events()
+            dialog_class.assert_called_once()
+            license_text = dialog_class.call_args.args[0]
+            self.assertIn("Copyright 2014-2025 Adobe", license_text)
+            self.assertIn("SIL OPEN FONT LICENSE Version 1.1", license_text)
+            dialog_class.return_value.exec.assert_called_once_with()
+        finally:
+            self.close_page(page)
+
+    def test_missing_font_license_reports_an_error(self) -> None:
+        page = self.make_page()
+        try:
+            with (
+                patch("gui.resource_path", return_value=Path("missing-license.txt")),
+                patch.object(page, "_show_message") as show_message,
+            ):
+                page.font_license_button.click()
+            show_message.assert_called_once_with("error", "开源字体许可证文件缺失")
+        finally:
+            self.close_page(page)
+
+    def test_unreadable_font_license_reports_an_error(self) -> None:
+        page = self.make_page()
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                invalid_license = Path(temp_dir) / "LICENSE.txt"
+                invalid_license.write_bytes(b"\xff\xfe\xfa")
+                with (
+                    patch("gui.resource_path", return_value=invalid_license),
+                    patch.object(page, "_show_message") as show_message,
+                ):
+                    page.font_license_button.click()
+            show_message.assert_called_once_with(
+                "error",
+                "开源字体许可证文件无法读取",
+            )
         finally:
             self.close_page(page)
 

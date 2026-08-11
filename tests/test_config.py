@@ -6,6 +6,7 @@ from config import (
     COMPREHENSIVE_FEATURE_DEFAULTS,
     DEFAULT_MANUAL_QUALITY,
     FEATURE_DEFAULTS,
+    FEATURE_REFERENCE_NOTICE,
     FEATURE_WATERMARK,
     MAX_MANUAL_QUALITY,
     MIN_MANUAL_QUALITY,
@@ -18,21 +19,23 @@ class CompressionDefaultsTestCase(unittest.TestCase):
         self.assertEqual(MIN_MANUAL_QUALITY, 1)
         self.assertEqual(MAX_MANUAL_QUALITY, 100)
 
-    def test_only_watermark_is_disabled_by_default(self) -> None:
-        self.assertFalse(FEATURE_DEFAULTS[FEATURE_WATERMARK])
-        self.assertFalse(COMPREHENSIVE_FEATURE_DEFAULTS[FEATURE_WATERMARK])
+    def test_optional_watermark_and_reference_notice_are_disabled_by_default(self) -> None:
+        disabled_by_default = {FEATURE_WATERMARK, FEATURE_REFERENCE_NOTICE}
+        for feature in disabled_by_default:
+            self.assertFalse(FEATURE_DEFAULTS[feature])
+            self.assertFalse(COMPREHENSIVE_FEATURE_DEFAULTS[feature])
         self.assertTrue(
             all(
                 enabled
                 for feature, enabled in FEATURE_DEFAULTS.items()
-                if feature != FEATURE_WATERMARK
+                if feature not in disabled_by_default
             )
         )
         self.assertTrue(
             all(
                 enabled
                 for feature, enabled in COMPREHENSIVE_FEATURE_DEFAULTS.items()
-                if feature != FEATURE_WATERMARK
+                if feature not in disabled_by_default
             )
         )
 

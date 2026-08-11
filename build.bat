@@ -10,6 +10,16 @@ if errorlevel 1 (
     exit /b 1
 )
 
+if not exist "assets\fonts\SourceHanSansCN-Medium.otf" (
+    echo Reference notice font asset not found.
+    exit /b 1
+)
+
+if not exist "assets\fonts\LICENSE.txt" (
+    echo Reference notice font license not found.
+    exit /b 1
+)
+
 python -m PyInstaller --noconfirm --clean image_tool.spec
 
 endlocal

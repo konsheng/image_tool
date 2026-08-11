@@ -8,18 +8,29 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PIL import Image
 from PySide6.QtCore import QSettings, QSize
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QListView, QListWidgetItem
+from PySide6.QtWidgets import QApplication, QLabel, QListView, QListWidgetItem
 from qfluentwidgets import qrouter
 
 from config import (
     COMPREHENSIVE_FEATURE_DEFAULTS,
     CUSTOM_SIZE_LABEL,
     DEFAULT_MANUAL_QUALITY,
+    DEFAULT_REFERENCE_NOTICE_AUTO_FONT_SIZE,
+    DEFAULT_REFERENCE_NOTICE_BACKGROUND_OPACITY,
+    DEFAULT_REFERENCE_NOTICE_FONT_SIZE,
+    DEFAULT_REFERENCE_NOTICE_POSITION,
+    DEFAULT_REFERENCE_NOTICE_TEXT,
+    DEFAULT_WATERMARK_POSITION,
     FEATURE_DEFAULTS,
     MAX_OUTPUT_DIMENSION,
     MAX_OUTPUT_PIXELS,
+    REFERENCE_NOTICE_FONT_NAME,
+    REFERENCE_NOTICE_FONT_RELATIVE_PATH,
+    REFERENCE_NOTICE_POSITIONS,
+    WATERMARK_TYPE_TEXT,
 )
 from gui import (
     AdaptiveLogoListWidget,
@@ -32,12 +43,17 @@ from gui import (
     MODE_COMPREHENSIVE,
     MODE_FORMAT,
     MODE_LOGO,
+    MODE_REFERENCE_NOTICE,
     MODE_RESIZE,
     MODE_WATERMARK,
     PageSettings,
+    PreviewRequest,
+    PreviewWorker,
     comprehensive_feature_setting_key,
     feature_setting_key,
+    resource_path,
 )
+from image_processor import ProcessOptions, ReferenceNoticeOptions, WatermarkOptions
 from logo_manager import LogoAsset
 
 
@@ -72,6 +88,10 @@ class GuiFeatureTestCase(unittest.TestCase):
                     window.comprehensive_feature_states,
                     COMPREHENSIVE_FEATURE_DEFAULTS,
                 )
+                self.assertIs(
+                    window.feature_pages[MODE_REFERENCE_NOTICE],
+                    window.reference_notice_page,
+                )
                 for page in (window.comprehensive_page, window.compress_page):
                     self.assertFalse(hasattr(page, "warning_label"))
                     self.assertEqual(page.quality_slider.value(), DEFAULT_MANUAL_QUALITY)
@@ -81,6 +101,14 @@ class GuiFeatureTestCase(unittest.TestCase):
                 self.assertTrue(window.feature_nav_items[MODE_WATERMARK].isHidden())
                 self.assertTrue(
                     window.comprehensive_page.feature_sections[MODE_WATERMARK].isHidden()
+                )
+                self.assertTrue(
+                    window.feature_nav_items[MODE_REFERENCE_NOTICE].isHidden()
+                )
+                self.assertTrue(
+                    window.comprehensive_page.feature_sections[
+                        MODE_REFERENCE_NOTICE
+                    ].isHidden()
                 )
 
                 window.settings_page.comprehensive_feature_switches[
@@ -92,6 +120,19 @@ class GuiFeatureTestCase(unittest.TestCase):
                     window.comprehensive_page.feature_sections[MODE_WATERMARK].isHidden()
                 )
 
+                window.settings_page.comprehensive_feature_switches[
+                    MODE_REFERENCE_NOTICE
+                ].setChecked(True)
+                self.process_events()
+                self.assertTrue(
+                    window.feature_nav_items[MODE_REFERENCE_NOTICE].isHidden()
+                )
+                self.assertFalse(
+                    window.comprehensive_page.feature_sections[
+                        MODE_REFERENCE_NOTICE
+                    ].isHidden()
+                )
+
                 window.comprehensive_page.watermark_checkbox.setChecked(True)
                 self.assertTrue(window.comprehensive_page._get_apply_watermark())
                 watermark_options, watermark_error = (
@@ -99,6 +140,16 @@ class GuiFeatureTestCase(unittest.TestCase):
                 )
                 self.assertIsNotNone(watermark_options)
                 self.assertIsNone(watermark_error)
+
+                window.comprehensive_page.reference_notice_checkbox.setChecked(True)
+                self.assertTrue(
+                    window.comprehensive_page._get_apply_reference_notice()
+                )
+                reference_options, reference_error = (
+                    window.comprehensive_page._get_reference_notice_options()
+                )
+                self.assertIsNotNone(reference_options)
+                self.assertIsNone(reference_error)
 
                 for feature in (
                     MODE_COMPREHENSIVE,
@@ -124,6 +175,7 @@ class GuiFeatureTestCase(unittest.TestCase):
                         MODE_COMPRESS: False,
                         MODE_LOGO: True,
                         MODE_WATERMARK: True,
+                        MODE_REFERENCE_NOTICE: True,
                     }
                 )
                 expected_comprehensive_states = {
@@ -132,6 +184,7 @@ class GuiFeatureTestCase(unittest.TestCase):
                     MODE_COMPRESS: True,
                     MODE_LOGO: False,
                     MODE_WATERMARK: False,
+                    MODE_REFERENCE_NOTICE: False,
                 }
                 for feature, enabled in expected_page_states.items():
                     window.settings_page.feature_switches[feature].setChecked(enabled)
@@ -161,6 +214,7 @@ class GuiFeatureTestCase(unittest.TestCase):
                 self.assertEqual(page._get_manual_quality(), DEFAULT_MANUAL_QUALITY)
                 self.assertFalse(page._get_apply_logo())
                 self.assertFalse(page._get_apply_watermark())
+                self.assertFalse(page._get_apply_reference_notice())
                 self.assertFalse(page.output_card.isHidden())
                 page_settings = page._get_page_settings()
                 self.assertIsNotNone(page_settings)
@@ -170,6 +224,7 @@ class GuiFeatureTestCase(unittest.TestCase):
                 self.assertEqual(page_settings.quality, DEFAULT_MANUAL_QUALITY)
                 self.assertFalse(page_settings.apply_logo)
                 self.assertIsNone(page_settings.watermark_options)
+                self.assertIsNone(page_settings.reference_notice_options)
 
                 settings.sync()
             finally:
@@ -182,6 +237,14 @@ class GuiFeatureTestCase(unittest.TestCase):
                     restored.comprehensive_feature_states,
                     expected_comprehensive_states,
                 )
+                self.assertFalse(
+                    restored.feature_nav_items[MODE_REFERENCE_NOTICE].isHidden()
+                )
+                self.assertTrue(
+                    restored.comprehensive_page.feature_sections[
+                        MODE_REFERENCE_NOTICE
+                    ].isHidden()
+                )
                 for feature, enabled in expected_comprehensive_states.items():
                     self.assertEqual(
                         restored.comprehensive_page.is_feature_enabled(feature),
@@ -193,6 +256,393 @@ class GuiFeatureTestCase(unittest.TestCase):
                     )
             finally:
                 self.close_window(restored)
+
+    def test_reference_notice_defaults_validation_and_pipeline(self) -> None:
+        page = ImageOperationPage(
+            "参考图提示",
+            MODE_REFERENCE_NOTICE,
+            "referenceNoticeOptionsTest",
+        )
+        try:
+            window_page = page
+            self.assertTrue(window_page.always_apply_reference_notice)
+            self.assertFalse(hasattr(window_page, "reference_notice_checkbox"))
+            self.assertEqual(
+                window_page.reference_notice_text_edit.text(),
+                DEFAULT_REFERENCE_NOTICE_TEXT,
+            )
+            self.assertEqual(
+                DEFAULT_REFERENCE_NOTICE_TEXT,
+                "广告创意 图片仅供参考",
+            )
+            self.assertEqual(
+                window_page.reference_notice_auto_font_checkbox.isChecked(),
+                DEFAULT_REFERENCE_NOTICE_AUTO_FONT_SIZE,
+            )
+            self.assertEqual(
+                window_page.reference_notice_font_size_edit.text(),
+                str(DEFAULT_REFERENCE_NOTICE_FONT_SIZE),
+            )
+            self.assertEqual(
+                window_page.reference_notice_opacity_edit.text(),
+                str(DEFAULT_REFERENCE_NOTICE_BACKGROUND_OPACITY),
+            )
+            self.assertFalse(hasattr(window_page, "reference_notice_margin_edit"))
+            self.assertFalse(hasattr(window_page, "reference_notice_position_label"))
+            self.assertIn(
+                "添加四角贴边角标",
+                [
+                    label.text()
+                    for label in window_page.reference_notice_card.findChildren(
+                        QLabel
+                    )
+                ],
+            )
+            self.assertFalse(window_page.reference_notice_font_size_edit.isEnabled())
+            self.assertIn(
+                REFERENCE_NOTICE_FONT_NAME,
+                window_page.reference_notice_font_label.text(),
+            )
+            self.assertIn("SIL OFL 1.1", window_page.reference_notice_font_label.text())
+            self.assertEqual(
+                window_page.reference_notice_position_combo.currentData(),
+                DEFAULT_REFERENCE_NOTICE_POSITION,
+            )
+            self.assertEqual(
+                window_page.reference_notice_position_combo.currentText(),
+                f"{DEFAULT_REFERENCE_NOTICE_POSITION}角",
+            )
+            self.assertEqual(
+                [
+                    window_page.reference_notice_position_combo.itemData(index)
+                    for index in range(
+                        window_page.reference_notice_position_combo.count()
+                    )
+                ],
+                REFERENCE_NOTICE_POSITIONS,
+            )
+            self.assertEqual(
+                [
+                    window_page.reference_notice_position_combo.itemText(index)
+                    for index in range(
+                        window_page.reference_notice_position_combo.count()
+                    )
+                ],
+                [f"{position}角" for position in REFERENCE_NOTICE_POSITIONS],
+            )
+            self.assertIn("贴紧所选角落对应的两条图片边缘", window_page.reference_notice_hint_label.text())
+            self.assertIn(
+                "苹果式连续圆角朝向图片内部",
+                window_page.reference_notice_hint_label.text(),
+            )
+            self.assertIn("相同角落的水印", window_page.reference_notice_hint_label.text())
+
+            font_path = resource_path(REFERENCE_NOTICE_FONT_RELATIVE_PATH)
+            self.assertTrue(font_path.is_file())
+
+            automatic_options, automatic_error = (
+                window_page._get_reference_notice_options()
+            )
+            self.assertIsNone(automatic_error)
+            self.assertIsNotNone(automatic_options)
+            assert automatic_options is not None
+            self.assertEqual(automatic_options.text, DEFAULT_REFERENCE_NOTICE_TEXT)
+            self.assertEqual(automatic_options.font_path, font_path)
+            self.assertEqual(automatic_options.font_size, 0)
+            self.assertEqual(
+                automatic_options.position,
+                DEFAULT_REFERENCE_NOTICE_POSITION,
+            )
+
+            window_page.reference_notice_auto_font_checkbox.setChecked(False)
+            self.process_events()
+            self.assertTrue(window_page.reference_notice_font_size_edit.isEnabled())
+            window_page.reference_notice_font_size_edit.setText("48")
+            window_page.reference_notice_opacity_edit.setText("72")
+            for position in REFERENCE_NOTICE_POSITIONS:
+                with self.subTest(position=position):
+                    position_index = (
+                        window_page.reference_notice_position_combo.findData(position)
+                    )
+                    self.assertGreaterEqual(position_index, 0)
+                    previous_request_serial = window_page.preview_request_serial
+                    window_page.reference_notice_position_combo.setCurrentIndex(
+                        position_index
+                    )
+                    self.assertGreater(
+                        window_page.preview_request_serial,
+                        previous_request_serial,
+                    )
+                    position_options, position_error = (
+                        window_page._get_reference_notice_options()
+                    )
+                    self.assertIsNone(position_error)
+                    self.assertIsNotNone(position_options)
+                    assert position_options is not None
+                    self.assertEqual(position_options.position, position)
+                    self.assertEqual(position_options.font_size, 48)
+                    self.assertEqual(position_options.background_opacity, 72)
+
+            selected_position = REFERENCE_NOTICE_POSITIONS[0]
+            window_page.reference_notice_position_combo.setCurrentIndex(
+                window_page.reference_notice_position_combo.findData(
+                    selected_position
+                )
+            )
+            manual_options, manual_error = window_page._get_reference_notice_options()
+            self.assertIsNone(manual_error)
+            self.assertIsNotNone(manual_options)
+            assert manual_options is not None
+            self.assertEqual(manual_options.position, selected_position)
+
+            page_settings = window_page._get_page_settings()
+            self.assertIsNotNone(page_settings)
+            assert page_settings is not None
+            self.assertEqual(page_settings.reference_notice_options, manual_options)
+
+            for invalid_font_size in ("0", "501", "not-a-number"):
+                window_page.reference_notice_font_size_edit.setText(invalid_font_size)
+                invalid_options, invalid_error = (
+                    window_page._get_reference_notice_options()
+                )
+                self.assertIsNone(invalid_options)
+                self.assertEqual(invalid_error, "请输入正确的参考图提示字号")
+
+            window_page.reference_notice_font_size_edit.setText("48")
+            for invalid_opacity in ("0", "101", "not-a-number"):
+                window_page.reference_notice_opacity_edit.setText(invalid_opacity)
+                invalid_options, invalid_error = (
+                    window_page._get_reference_notice_options()
+                )
+                self.assertIsNone(invalid_options)
+                self.assertEqual(invalid_error, "请输入正确的提示背景透明度")
+
+            window_page.reference_notice_opacity_edit.setText("72")
+            window_page.reference_notice_text_edit.setText("   ")
+            invalid_options, invalid_error = window_page._get_reference_notice_options()
+            self.assertIsNone(invalid_options)
+            self.assertEqual(invalid_error, "请输入参考图提示文字")
+            window_page.reference_notice_text_edit.setText(DEFAULT_REFERENCE_NOTICE_TEXT)
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                source = Path(temp_dir) / "preview.jpg"
+                source.write_bytes(b"preview-source")
+                item = ImageListItem(source, "JPG", "100 × 100", "14B")
+                window_page.items = [item]
+                window_page._append_table_row(item)
+                window_page.table.selectRow(0)
+                window_page._refresh_preview()
+
+                request = window_page.pending_preview_request
+                self.assertIsNotNone(request)
+                assert request is not None
+                self.assertEqual(
+                    request.options.reference_notice_options,
+                    manual_options,
+                )
+
+            window_page._set_processing_state(True)
+            for control in (
+                window_page.reference_notice_text_edit,
+                window_page.reference_notice_auto_font_checkbox,
+                window_page.reference_notice_font_size_edit,
+                window_page.reference_notice_position_combo,
+                window_page.reference_notice_opacity_edit,
+            ):
+                self.assertFalse(control.isEnabled())
+            window_page._set_processing_state(False)
+            self.assertTrue(window_page.reference_notice_text_edit.isEnabled())
+            self.assertTrue(window_page.reference_notice_auto_font_checkbox.isEnabled())
+            self.assertTrue(window_page.reference_notice_font_size_edit.isEnabled())
+            self.assertTrue(window_page.reference_notice_position_combo.isEnabled())
+            self.assertTrue(window_page.reference_notice_opacity_edit.isEnabled())
+            self.assertEqual(
+                window_page.reference_notice_position_combo.currentData(),
+                selected_position,
+            )
+        finally:
+            page.shutdown()
+            page.close()
+            page.deleteLater()
+            self.process_events()
+
+    def test_reference_notice_card_fits_the_minimum_window_width(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window, _ = self.make_window(Path(temp_dir) / "settings.ini")
+            try:
+                window.resize(1060, 720)
+                window.switchTo(window.comprehensive_page)
+                self.process_events()
+                comprehensive_baseline_scroll = (
+                    window.comprehensive_page.scroll_area.horizontalScrollBar().maximum()
+                )
+                window.settings_page.feature_switches[
+                    MODE_REFERENCE_NOTICE
+                ].setChecked(True)
+                window.settings_page.comprehensive_feature_switches[
+                    MODE_REFERENCE_NOTICE
+                ].setChecked(True)
+                self.process_events()
+
+                for page in (
+                    window.reference_notice_page,
+                    window.comprehensive_page,
+                ):
+                    with self.subTest(page=page.objectName()):
+                        window.switchTo(page)
+                        self.process_events()
+                        self.assertFalse(page.reference_notice_card.isHidden())
+                        margins = page.container.layout().contentsMargins()
+                        available_card_width = (
+                            page.scroll_area.viewport().width()
+                            - margins.left()
+                            - margins.right()
+                        )
+                        self.assertLessEqual(
+                            page.reference_notice_card.minimumSizeHint().width(),
+                            available_card_width,
+                        )
+                        if page is window.reference_notice_page:
+                            self.assertLessEqual(
+                                page.scroll_area.horizontalScrollBar().maximum(),
+                                1,
+                            )
+                        else:
+                            self.assertLessEqual(
+                                page.scroll_area.horizontalScrollBar().maximum(),
+                                comprehensive_baseline_scroll,
+                            )
+                        for control in (
+                            page.reference_notice_text_edit,
+                            page.reference_notice_font_label,
+                            page.reference_notice_auto_font_checkbox,
+                            page.reference_notice_font_size_edit,
+                            page.reference_notice_position_combo,
+                            page.reference_notice_opacity_edit,
+                        ):
+                            self.assertLessEqual(
+                                control.geometry().right(),
+                                page.scroll_area.viewport().width(),
+                            )
+                        self.assertLess(
+                            page.reference_notice_font_label.geometry().bottom(),
+                            page.reference_notice_auto_font_checkbox.geometry().top(),
+                        )
+            finally:
+                self.close_window(window)
+
+    def test_preview_drag_is_disabled_only_for_an_actual_watermark_shift(self) -> None:
+        page = ImageOperationPage(
+            "综合处理",
+            MODE_COMPREHENSIVE,
+            "referenceNoticePreviewDragTest",
+        )
+        image = Image.new("RGB", (320, 240), "white")
+        cases = [
+            (request_id, position, position, 0, True)
+            for request_id, position in enumerate(
+                REFERENCE_NOTICE_POSITIONS,
+                start=1,
+            )
+        ]
+        cases.extend(
+            (
+                (
+                    len(cases) + 1,
+                    REFERENCE_NOTICE_POSITIONS[0],
+                    DEFAULT_WATERMARK_POSITION,
+                    0,
+                    False,
+                ),
+                (
+                    len(cases) + 2,
+                    DEFAULT_REFERENCE_NOTICE_POSITION,
+                    DEFAULT_WATERMARK_POSITION,
+                    -10_000,
+                    False,
+                ),
+            )
+        )
+        try:
+            for (
+                request_id,
+                notice_position,
+                watermark_position,
+                offset_y,
+                expected_shifted,
+            ) in cases:
+                with self.subTest(
+                    notice_position=notice_position,
+                    watermark_position=watermark_position,
+                    offset_y=offset_y,
+                ):
+                    notice = ReferenceNoticeOptions(
+                        text=DEFAULT_REFERENCE_NOTICE_TEXT,
+                        font_path=resource_path(
+                            REFERENCE_NOTICE_FONT_RELATIVE_PATH
+                        ),
+                        font_size=24,
+                        position=notice_position,
+                    )
+                    watermark = WatermarkOptions(
+                        watermark_type=WATERMARK_TYPE_TEXT,
+                        text="preview watermark",
+                        position=watermark_position,
+                        margin=0,
+                        offset_y=offset_y,
+                    )
+                    request = PreviewRequest(
+                        request_id=request_id,
+                        source_path=Path("unused-preview-source.jpg"),
+                        file_name="preview.jpg",
+                        source_size=100,
+                        options=ProcessOptions(
+                            output_format="JPG",
+                            output_size=None,
+                            apply_logo=False,
+                            logos=[],
+                            watermark_options=watermark,
+                            reference_notice_options=notice,
+                        ),
+                        logo_assets=[],
+                    )
+                    outcomes: list[tuple[int, object]] = []
+                    errors: list[tuple[int, str]] = []
+                    worker = PreviewWorker(request)
+                    worker.succeeded.connect(
+                        lambda emitted_id, outcome: outcomes.append(
+                            (emitted_id, outcome)
+                        )
+                    )
+                    worker.failed.connect(
+                        lambda emitted_id, reason: errors.append((emitted_id, reason))
+                    )
+
+                    with patch("gui.render_preview_image", return_value=image.copy()):
+                        worker.run()
+
+                    self.assertEqual(errors, [])
+                    self.assertEqual(len(outcomes), 1)
+                    emitted_id, outcome = outcomes[0]
+                    self.assertEqual(emitted_id, request_id)
+                    self.assertEqual(outcome.watermark_shifted, expected_shifted)
+
+                    page._set_preview_image(
+                        outcome.image,
+                        outcome.file_name,
+                        outcome.watermark_options,
+                        outcome.reference_notice_options,
+                        watermark_shifted=outcome.watermark_shifted,
+                    )
+                    self.assertEqual(
+                        page.preview_image_label._drag_enabled,
+                        not expected_shifted,
+                    )
+        finally:
+            page.shutdown()
+            page.close()
+            page.deleteLater()
+            self.process_events()
 
     def test_legacy_global_switches_are_migrated_once_then_decoupled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -381,6 +831,7 @@ class GuiFeatureTestCase(unittest.TestCase):
                     apply_logo=True,
                     logo_assets=assets,
                     watermark_options=None,
+                    reference_notice_options=None,
                 )
                 tasks = page._prepare_tasks(settings)
 
@@ -396,10 +847,25 @@ class GuiFeatureTestCase(unittest.TestCase):
         page = ImageOperationPage("综合处理", MODE_COMPREHENSIVE, "featureStateCycleTest")
         try:
             page.watermark_checkbox.setChecked(True)
+            page.reference_notice_checkbox.setChecked(True)
             page._update_compression_controls_state()
             page._update_watermark_controls_state()
+            page._update_reference_notice_controls_state()
             self.assertTrue(page.quality_slider.isEnabled())
             self.assertTrue(page.watermark_type_combo.isEnabled())
+            self.assertTrue(page.reference_notice_text_edit.isEnabled())
+            self.assertFalse(page.reference_notice_font_size_edit.isEnabled())
+            self.assertTrue(page.reference_notice_position_combo.isEnabled())
+
+            selected_position = REFERENCE_NOTICE_POSITIONS[0]
+            page.reference_notice_position_combo.setCurrentIndex(
+                page.reference_notice_position_combo.findData(selected_position)
+            )
+            self.process_events()
+            self.assertEqual(
+                page.reference_notice_position_combo.currentData(),
+                selected_position,
+            )
 
             page.quality_slider.setValue(73)
             self.process_events()
@@ -407,13 +873,21 @@ class GuiFeatureTestCase(unittest.TestCase):
 
             page.set_feature_enabled(MODE_COMPRESS, False)
             page.set_feature_enabled(MODE_WATERMARK, False)
+            page.set_feature_enabled(MODE_REFERENCE_NOTICE, False)
             self.assertFalse(page.quality_slider.isEnabled())
             self.assertFalse(page.quality_spinbox.isEnabled())
             self.assertFalse(page.quality_reset_button.isEnabled())
+            self.assertFalse(page.reference_notice_text_edit.isEnabled())
+            self.assertFalse(page.reference_notice_position_combo.isEnabled())
+            self.assertEqual(
+                page.reference_notice_position_combo.currentData(),
+                selected_position,
+            )
             page._set_processing_state(True)
             page._set_processing_state(False)
             page.set_feature_enabled(MODE_COMPRESS, True)
             page.set_feature_enabled(MODE_WATERMARK, True)
+            page.set_feature_enabled(MODE_REFERENCE_NOTICE, True)
 
             self.assertTrue(page.quality_slider.isEnabled())
             self.assertTrue(page.quality_spinbox.isEnabled())
@@ -421,11 +895,34 @@ class GuiFeatureTestCase(unittest.TestCase):
             self.assertTrue(page.watermark_checkbox.isChecked())
             self.assertTrue(page.watermark_type_combo.isEnabled())
             self.assertTrue(page.watermark_text_edit.isEnabled())
+            self.assertTrue(page.reference_notice_checkbox.isChecked())
+            self.assertTrue(page.reference_notice_text_edit.isEnabled())
+            self.assertTrue(page.reference_notice_position_combo.isEnabled())
+            self.assertEqual(
+                page.reference_notice_position_combo.currentData(),
+                selected_position,
+            )
+
+            page.reference_notice_auto_font_checkbox.setChecked(False)
+            self.process_events()
+            self.assertTrue(page.reference_notice_font_size_edit.isEnabled())
 
             page._set_processing_state(True)
             self.assertFalse(page.quality_reset_button.isEnabled())
+            self.assertFalse(page.reference_notice_checkbox.isEnabled())
+            self.assertFalse(page.reference_notice_text_edit.isEnabled())
+            self.assertFalse(page.reference_notice_font_size_edit.isEnabled())
+            self.assertFalse(page.reference_notice_position_combo.isEnabled())
             page._set_processing_state(False)
             self.assertTrue(page.quality_reset_button.isEnabled())
+            self.assertTrue(page.reference_notice_checkbox.isEnabled())
+            self.assertTrue(page.reference_notice_text_edit.isEnabled())
+            self.assertTrue(page.reference_notice_font_size_edit.isEnabled())
+            self.assertTrue(page.reference_notice_position_combo.isEnabled())
+            self.assertEqual(
+                page.reference_notice_position_combo.currentData(),
+                selected_position,
+            )
         finally:
             page.shutdown()
             page.close()

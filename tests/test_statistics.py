@@ -12,7 +12,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QAbstractButton, QApplication
 
-from config import STATUS_CANCELED, STATUS_FAILED, STATUS_SUCCESS
+from config import (
+    REFERENCE_NOTICE_FONT_RELATIVE_PATH,
+    STATUS_CANCELED,
+    STATUS_FAILED,
+    STATUS_SUCCESS,
+)
 from gui import (
     ImageOperationPage,
     ImageToolWindow,
@@ -25,7 +30,9 @@ from gui import (
     STATISTICS_PROCESSED_COUNT_KEY,
     STATISTICS_SOURCE_BYTES_KEY,
     load_processing_statistics,
+    resource_path,
 )
+from image_processor import ReferenceNoticeOptions
 
 
 class TrackingSettings(QSettings):
@@ -69,13 +76,14 @@ class StatisticsTestCase(unittest.TestCase):
                 ProcessedOutput(4_000, 1_000),
                 ProcessedOutput(5_000, 2_000),
                 ProcessedOutput(6_000, 3_000),
+                ProcessedOutput(7_000, 4_000),
             ]
             expected_source = 0
             expected_output = 0
             baseline_sync_calls = settings.sync_calls
 
             try:
-                self.assertEqual(len(window.operation_pages), 6)
+                self.assertEqual(len(window.operation_pages), 7)
                 for index, (page, output) in enumerate(
                     zip(window.operation_pages, outputs, strict=True),
                     start=1,
@@ -115,11 +123,11 @@ class StatisticsTestCase(unittest.TestCase):
             try:
                 self.assertEqual(
                     restored_window.processing_statistics,
-                    ProcessingStatistics(6, expected_source, expected_output),
+                    ProcessingStatistics(7, expected_source, expected_output),
                 )
                 self.assertEqual(
                     restored_window.comprehensive_page.statistics_count_label.text(),
-                    "6 张",
+                    "7 张",
                 )
                 self.assertEqual(
                     restored_window.comprehensive_page.statistics_space_caption.text(),
@@ -215,12 +223,19 @@ class StatisticsTestCase(unittest.TestCase):
                     )
                 )
 
+            reference_notice_options = ReferenceNoticeOptions(
+                text="图片仅供参考",
+                font_path=resource_path(REFERENCE_NOTICE_FONT_RELATIVE_PATH),
+                font_size=0,
+                background_opacity=65,
+            )
             worker = ProcessingWorker(
                 tasks=tasks,
                 output_size=None,
                 quality=95,
                 logo_cache={},
                 watermark_options=None,
+                reference_notice_options=reference_notice_options,
             )
             committed: list[ProcessedOutput] = []
             statuses: list[tuple[int, str]] = []
@@ -259,6 +274,11 @@ class StatisticsTestCase(unittest.TestCase):
                 worker.run()
 
             self.assertEqual(mocked_process.call_count, 3)
+            for call in mocked_process.call_args_list:
+                self.assertIs(
+                    call.args[2].reference_notice_options,
+                    reference_notice_options,
+                )
             self.assertEqual(
                 committed,
                 [ProcessedOutput(11, 4), ProcessedOutput(22, 30)],

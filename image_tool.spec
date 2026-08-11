@@ -19,6 +19,10 @@ if logo_dir.exists():
         if logo_path.is_file() and logo_path.suffix.lower() in logo_extensions:
             datas.append((str(logo_path), "assets/logos"))
 
+font_dir = Path("assets/fonts")
+if font_dir.exists():
+    datas.append((str(font_dir), "assets/fonts"))
+
 qfluent_datas, qfluent_binaries, qfluent_hiddenimports = collect_all("qfluentwidgets")
 datas += qfluent_datas
 binaries += qfluent_binaries
