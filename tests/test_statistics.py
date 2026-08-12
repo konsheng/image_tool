@@ -77,13 +77,14 @@ class StatisticsTestCase(unittest.TestCase):
                 ProcessedOutput(5_000, 2_000),
                 ProcessedOutput(6_000, 3_000),
                 ProcessedOutput(7_000, 4_000),
+                ProcessedOutput(8_000, 5_000),
             ]
             expected_source = 0
             expected_output = 0
             baseline_sync_calls = settings.sync_calls
 
             try:
-                self.assertEqual(len(window.operation_pages), 7)
+                self.assertEqual(len(window.operation_pages), 8)
                 for index, (page, output) in enumerate(
                     zip(window.operation_pages, outputs, strict=True),
                     start=1,
@@ -123,11 +124,11 @@ class StatisticsTestCase(unittest.TestCase):
             try:
                 self.assertEqual(
                     restored_window.processing_statistics,
-                    ProcessingStatistics(7, expected_source, expected_output),
+                    ProcessingStatistics(8, expected_source, expected_output),
                 )
                 self.assertEqual(
                     restored_window.comprehensive_page.statistics_count_label.text(),
-                    "7 张",
+                    "8 张",
                 )
                 self.assertEqual(
                     restored_window.comprehensive_page.statistics_space_caption.text(),
@@ -291,6 +292,29 @@ class StatisticsTestCase(unittest.TestCase):
             self.assertEqual(len(finished), 1)
             total, success, failure, _last_output_dir, canceled = finished[0]
             self.assertEqual((total, success, failure, canceled), (4, 2, 1, True))
+
+    def test_worker_honors_cancellation_before_first_item(self) -> None:
+        task = ProcessingTask(
+            row=0,
+            source_path=Path("source.jpg"),
+            output_path=Path("output.jpg"),
+            output_format="JPG",
+            apply_logo=False,
+            logo_assets=[],
+        )
+        worker = ProcessingWorker([task], None, 95, {}, None)
+        statuses: list[tuple[int, str]] = []
+        finished: list[tuple[object, ...]] = []
+        worker.item_finished.connect(lambda row, status: statuses.append((row, status)))
+        worker.finished.connect(lambda *args: finished.append(args))
+        worker.request_cancel()
+
+        with patch("gui.process_image") as process:
+            worker.run()
+
+        process.assert_not_called()
+        self.assertEqual(statuses, [(0, STATUS_CANCELED)])
+        self.assertEqual(finished, [(1, 0, 0, None, True)])
 
 
 if __name__ == "__main__":

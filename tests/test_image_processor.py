@@ -9,6 +9,7 @@ from unittest.mock import patch
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 import image_processor
+from blind_watermark_service import BlindWatermarkOptions
 from config import (
     DEFAULT_MANUAL_QUALITY,
     DEFAULT_REFERENCE_NOTICE_BACKGROUND_OPACITY,
@@ -50,6 +51,7 @@ def make_options(**overrides: object) -> ProcessOptions:
         "logos": [],
         "watermark_options": None,
         "reference_notice_options": None,
+        "blind_watermark_options": None,
         "quality": None,
     }
     values.update(overrides)
@@ -62,6 +64,28 @@ class ProcessOptionsTestCase(unittest.TestCase):
 
         self.assertEqual(options.quality, 95)
         self.assertIsNone(options.reference_notice_options)
+        self.assertIsNone(options.blind_watermark_options)
+
+    def test_blind_watermark_field_is_last_and_preserves_all_legacy_positions(self) -> None:
+        blind_watermark = BlindWatermarkOptions(
+            text="ownership",
+            password_image=2026,
+            password_watermark=2027,
+        )
+        options = ProcessOptions(
+            "JPG",
+            None,
+            False,
+            [],
+            None,
+            95,
+            None,
+            blind_watermark,
+        )
+
+        self.assertEqual(options.quality, 95)
+        self.assertIsNone(options.reference_notice_options)
+        self.assertIs(options.blind_watermark_options, blind_watermark)
 
     def test_quality_must_be_in_supported_range(self) -> None:
         for quality in (0, 101):
@@ -123,6 +147,7 @@ class ReferenceNoticeOptionsTestCase(unittest.TestCase):
     def test_default_opacity_matches_application_configuration(self) -> None:
         options = ReferenceNoticeOptions("NOTICE", self.font_path)
 
+        self.assertEqual(DEFAULT_REFERENCE_NOTICE_BACKGROUND_OPACITY, 25)
         self.assertEqual(
             options.background_opacity,
             DEFAULT_REFERENCE_NOTICE_BACKGROUND_OPACITY,
@@ -444,10 +469,15 @@ class ReferenceNoticePipelineTestCase(unittest.TestCase):
 
         return side_effect
 
-    def test_processing_order_is_logo_watermark_notice_then_encoding(self) -> None:
+    def test_processing_order_is_visual_pipeline_blind_watermark_then_encoding(self) -> None:
         steps: list[str] = []
         watermark = WatermarkOptions(watermark_type="test", position="not-bottom-right")
         notice = self.notice_options()
+        blind_watermark = BlindWatermarkOptions(
+            text="ownership",
+            password_image=2026,
+            password_watermark=2027,
+        )
         original_encode = image_processor._encode_working_image
 
         def encode(image: Image.Image, options: ProcessOptions):
@@ -470,6 +500,11 @@ class ReferenceNoticePipelineTestCase(unittest.TestCase):
                 "apply_reference_notice",
                 side_effect=self.record_step(steps, "reference_notice"),
             ),
+            patch.object(
+                image_processor,
+                "embed_blind_watermark",
+                side_effect=self.record_step(steps, "blind_watermark"),
+            ),
             patch.object(image_processor, "_encode_working_image", side_effect=encode),
         ):
             process_image(
@@ -480,10 +515,73 @@ class ReferenceNoticePipelineTestCase(unittest.TestCase):
                     logos=[Image.new("RGBA", (1, 1))],
                     watermark_options=watermark,
                     reference_notice_options=notice,
+                    blind_watermark_options=blind_watermark,
                 ),
             )
 
-        self.assertEqual(steps, ["logo", "watermark", "reference_notice", "encode"])
+        self.assertEqual(
+            steps,
+            [
+                "logo",
+                "watermark",
+                "reference_notice",
+                "blind_watermark",
+                "encode",
+            ],
+        )
+
+    def test_blind_watermark_is_not_called_when_disabled(self) -> None:
+        with patch.object(image_processor, "embed_blind_watermark") as embed:
+            process_image(
+                self.source,
+                self.root / "without-blind-watermark.jpg",
+                make_options(),
+            )
+
+        embed.assert_not_called()
+
+    def test_preview_paths_never_embed_blind_watermark(self) -> None:
+        blind_watermark = BlindWatermarkOptions(
+            text="preview must skip",
+            password_image=2026,
+            password_watermark=2027,
+        )
+        options = make_options(blind_watermark_options=blind_watermark)
+
+        with patch.object(image_processor, "embed_blind_watermark") as embed:
+            preview = render_preview_image(self.source, options)
+            encoded_preview = render_encoded_preview_image(self.source, options)
+
+        embed.assert_not_called()
+        self.assertEqual(preview.size, (320, 240))
+        self.assertEqual(encoded_preview.image.size, (320, 240))
+
+    def test_blind_watermark_failure_does_not_write_output(self) -> None:
+        target = self.root / "missing" / "failed-output.jpg"
+        blind_watermark = BlindWatermarkOptions(
+            text="ownership",
+            password_image=2026,
+            password_watermark=2027,
+        )
+
+        with (
+            patch.object(
+                image_processor,
+                "embed_blind_watermark",
+                side_effect=RuntimeError("blind watermark failed"),
+            ),
+            patch.object(image_processor, "_encode_working_image") as encode,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "blind watermark failed"):
+                process_image(
+                    self.source,
+                    target,
+                    make_options(blind_watermark_options=blind_watermark),
+                )
+
+        encode.assert_not_called()
+        self.assertFalse(target.exists())
+        self.assertFalse(target.parent.exists())
 
     def test_bottom_right_watermark_moves_above_notice(self) -> None:
         notice = self.notice_options()
@@ -688,6 +786,113 @@ class ImageCompositionTestCase(unittest.TestCase):
 
 
 class EncodedProcessingTestCase(unittest.TestCase):
+    def make_source(self, root: Path) -> Path:
+        source = root / "source.png"
+        make_detailed_image().save(source, format="PNG")
+        return source
+
+    def assert_no_atomic_temp_files(self, directory: Path, target: Path) -> None:
+        self.assertEqual(
+            [path for path in directory.iterdir() if path.name.startswith(f".{target.name}.")],
+            [],
+        )
+
+    def test_process_image_atomically_replaces_existing_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = self.make_source(root)
+            target = root / "output.png"
+            target.write_bytes(b"old-output")
+
+            result = process_image(source, target, make_options(output_format="PNG"))
+
+            self.assertEqual(target.read_bytes(), result.compression.data)
+            self.assertNotEqual(target.read_bytes(), b"old-output")
+            self.assertEqual(result.output_size, target.stat().st_size)
+            self.assert_no_atomic_temp_files(root, target)
+
+    def test_atomic_write_failure_preserves_existing_target_and_cleans_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "output.png"
+            original = b"existing-output-must-survive"
+            target.write_bytes(original)
+
+            real_fdopen = image_processor.os.fdopen
+
+            class FailingWriter:
+                def __init__(self, descriptor: int) -> None:
+                    self.file = real_fdopen(descriptor, "wb")
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, traceback) -> None:
+                    self.file.close()
+
+                def write(self, data: bytes) -> int:
+                    self.file.write(data[:8])
+                    self.file.flush()
+                    raise OSError("simulated disk full")
+
+                def flush(self) -> None:
+                    self.file.flush()
+
+                def fileno(self) -> int:
+                    return self.file.fileno()
+
+            with patch.object(
+                image_processor.os,
+                "fdopen",
+                side_effect=lambda descriptor, _mode: FailingWriter(descriptor),
+            ):
+                with self.assertRaisesRegex(OSError, "simulated disk full"):
+                    image_processor._atomic_write_bytes(target, b"new-output")
+
+            self.assertEqual(target.read_bytes(), original)
+            self.assert_no_atomic_temp_files(root, target)
+
+    def test_atomic_replace_failure_preserves_existing_target_and_cleans_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "output.png"
+            original = b"existing-output-must-survive"
+            target.write_bytes(original)
+
+            with patch.object(
+                image_processor.os,
+                "replace",
+                side_effect=OSError("simulated replace failure"),
+            ) as replace:
+                with self.assertRaisesRegex(OSError, "simulated replace failure"):
+                    image_processor._atomic_write_bytes(target, b"new-output")
+
+            replace.assert_called_once()
+            self.assertEqual(target.read_bytes(), original)
+            self.assert_no_atomic_temp_files(root, target)
+
+    def test_process_image_creates_output_directory_only_when_committing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = self.make_source(root)
+            target = root / "new" / "nested" / "output.png"
+
+            with patch.object(
+                image_processor,
+                "_encode_working_image",
+                side_effect=RuntimeError("encoding failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "encoding failed"):
+                    process_image(source, target, make_options(output_format="PNG"))
+
+            self.assertFalse(target.parent.exists())
+
+            result = process_image(source, target, make_options(output_format="PNG"))
+
+            self.assertTrue(target.parent.is_dir())
+            self.assertEqual(target.read_bytes(), result.compression.data)
+            self.assert_no_atomic_temp_files(target.parent, target)
+
     def test_process_image_uses_default_quality(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

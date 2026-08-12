@@ -95,9 +95,18 @@ from config import (
     APP_AUTHOR,
     APP_NAME,
     APP_VERSION,
+    BLIND_WATERMARK_ACTION_EMBED,
+    BLIND_WATERMARK_ACTION_EXTRACT,
+    BLIND_WATERMARK_BIT_LENGTH_STEP,
+    BLIND_WATERMARK_FRAME_OVERHEAD_BYTES,
+    BLIND_WATERMARK_LICENSE_RELATIVE_PATH,
     COMPREHENSIVE_FEATURE_DEFAULTS,
     COMPREHENSIVE_FEATURE_SETTINGS_PREFIX,
     CUSTOM_SIZE_LABEL,
+    DEFAULT_BLIND_WATERMARK_ACTION,
+    DEFAULT_BLIND_WATERMARK_CONTENT_KEY,
+    DEFAULT_BLIND_WATERMARK_IMAGE_KEY,
+    DEFAULT_BLIND_WATERMARK_TEXT,
     DEFAULT_MANUAL_QUALITY,
     DEFAULT_REFERENCE_NOTICE_AUTO_FONT_SIZE,
     DEFAULT_REFERENCE_NOTICE_BACKGROUND_OPACITY,
@@ -122,6 +131,7 @@ from config import (
     DEFAULT_OUTPUT_SIZE,
     FEATURE_COMPRESS,
     FEATURE_COMPREHENSIVE,
+    FEATURE_BLIND_WATERMARK,
     FEATURE_DEFAULTS,
     FEATURE_FORMAT,
     FEATURE_LABELS,
@@ -133,10 +143,15 @@ from config import (
     FEATURE_WATERMARK,
     KEEP_ORIGINAL_FORMAT,
     MAX_MANUAL_QUALITY,
+    MAX_BLIND_WATERMARK_BIT_LENGTH,
+    MAX_BLIND_WATERMARK_KEY,
+    MAX_BLIND_WATERMARK_TEXT_BYTES,
     MAX_OUTPUT_DIMENSION,
     MAX_OUTPUT_PIXELS,
     MAX_REFERENCE_NOTICE_TEXT_LENGTH,
     MIN_MANUAL_QUALITY,
+    MIN_BLIND_WATERMARK_BIT_LENGTH,
+    MIN_BLIND_WATERMARK_KEY,
     OUTPUT_FORMATS,
     OUTPUT_SIZE_PRESETS,
     PROJECT_ISSUES_URL,
@@ -160,6 +175,10 @@ from config import (
     WATERMARK_TYPE_TEXT,
     WATERMARK_TYPES,
     size_to_text,
+)
+from blind_watermark_service import (
+    BlindWatermarkOptions,
+    extract_blind_watermark,
 )
 from file_utils import (
     build_default_output_path,
@@ -205,6 +224,7 @@ MODE_COMPRESS = FEATURE_COMPRESS
 MODE_LOGO = FEATURE_LOGO
 MODE_WATERMARK = FEATURE_WATERMARK
 MODE_REFERENCE_NOTICE = FEATURE_REFERENCE_NOTICE
+MODE_BLIND_WATERMARK = FEATURE_BLIND_WATERMARK
 MODE_MEMO = FEATURE_MEMO
 
 COMPREHENSIVE_FEATURES = (
@@ -214,6 +234,7 @@ COMPREHENSIVE_FEATURES = (
     MODE_LOGO,
     MODE_WATERMARK,
     MODE_REFERENCE_NOTICE,
+    MODE_BLIND_WATERMARK,
 )
 
 LOGO_ICON_SIZE = QSize(96, 64)
@@ -317,6 +338,7 @@ def theme_stylesheet() -> str:
         #logoPage,
         #watermarkPage,
         #referenceNoticePage,
+        #blindWatermarkPage,
         #memoPage,
         #settingsPage,
         #aboutPage,
@@ -616,6 +638,13 @@ class PageSettings:
     logo_assets: list[LogoAsset]
     watermark_options: WatermarkOptions | None
     reference_notice_options: ReferenceNoticeOptions | None = None
+    blind_watermark_options: BlindWatermarkOptions | None = None
+
+
+@dataclass(frozen=True)
+class BlindWatermarkExtractionTask:
+    row: int
+    source_path: Path
 
 
 @dataclass(frozen=True)
@@ -713,6 +742,7 @@ class ProcessingWorker(QObject):
         logo_cache: dict[str, Image.Image],
         watermark_options: WatermarkOptions | None,
         reference_notice_options: ReferenceNoticeOptions | None = None,
+        blind_watermark_options: BlindWatermarkOptions | None = None,
     ) -> None:
         super().__init__()
         self.tasks = tasks
@@ -721,6 +751,7 @@ class ProcessingWorker(QObject):
         self.logo_cache = logo_cache
         self.watermark_options = watermark_options
         self.reference_notice_options = reference_notice_options
+        self.blind_watermark_options = blind_watermark_options
         self.cancel_requested = False
 
     def request_cancel(self) -> None:
@@ -734,6 +765,11 @@ class ProcessingWorker(QObject):
         canceled = False
 
         for current, task in enumerate(self.tasks, start=1):
+            if self.cancel_requested:
+                canceled = True
+                for remaining_task in self.tasks[current - 1:]:
+                    self.item_finished.emit(remaining_task.row, STATUS_CANCELED)
+                break
             file_name = task.source_path.name
             self.item_started.emit(task.row, file_name)
 
@@ -757,6 +793,7 @@ class ProcessingWorker(QObject):
                         logos=logo_copies,
                         watermark_options=self.watermark_options,
                         reference_notice_options=self.reference_notice_options,
+                        blind_watermark_options=self.blind_watermark_options,
                     ),
                 )
                 last_output_dir = result.output_path.parent
@@ -785,6 +822,8 @@ class ProcessingWorker(QObject):
                     reason = "参考图提示字体加载失败"
                 elif "reference notice text" in reason or "参考图提示文字" in reason:
                     reason = "请输入参考图提示文字"
+                elif "盲水印" in reason:
+                    reason = reason
                 elif "图片无法打开" not in reason:
                     reason = "图片无法打开"
                 status = f"{STATUS_FAILED}：{reason}"
@@ -801,6 +840,72 @@ class ProcessingWorker(QObject):
         self.finished.emit(total, success, failure, last_output_dir, canceled)
 
 
+class BlindWatermarkExtractionWorker(QObject):
+    item_started = Signal(int, str)
+    item_finished = Signal(int, str)
+    extracted = Signal(int, str)
+    progress_changed = Signal(int, int, str, int, int)
+    finished = Signal(int, int, int, object, bool)
+
+    def __init__(
+        self,
+        tasks: list[BlindWatermarkExtractionTask],
+        *,
+        bit_length: int,
+        password_image: int,
+        password_watermark: int,
+    ) -> None:
+        super().__init__()
+        self.tasks = tasks
+        self.bit_length = bit_length
+        self.password_image = password_image
+        self.password_watermark = password_watermark
+        self.cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self.cancel_requested = True
+
+    def run(self) -> None:
+        total = len(self.tasks)
+        success = 0
+        failure = 0
+        canceled = False
+
+        for current, task in enumerate(self.tasks, start=1):
+            if self.cancel_requested:
+                canceled = True
+                for remaining_task in self.tasks[current - 1:]:
+                    self.item_finished.emit(remaining_task.row, STATUS_CANCELED)
+                break
+            file_name = task.source_path.name
+            self.item_started.emit(task.row, file_name)
+            try:
+                text = extract_blind_watermark(
+                    task.source_path,
+                    bit_length=self.bit_length,
+                    password_image=self.password_image,
+                    password_watermark=self.password_watermark,
+                )
+                self.extracted.emit(task.row, text)
+                success += 1
+                status = STATUS_SUCCESS
+            except Exception as exc:
+                failure += 1
+                reason = str(exc).strip() or "盲水印提取失败"
+                status = f"{STATUS_FAILED}：{reason}"
+
+            self.item_finished.emit(task.row, status)
+            self.progress_changed.emit(current, total, file_name, success, failure)
+
+            if self.cancel_requested:
+                canceled = True
+                for remaining_task in self.tasks[current:]:
+                    self.item_finished.emit(remaining_task.row, STATUS_CANCELED)
+                break
+
+        self.finished.emit(total, success, failure, None, canceled)
+
+
 class ImageOperationPage(QWidget):
     preview_collapse_requested = Signal(bool)
     output_committed = Signal(object)
@@ -815,7 +920,7 @@ class ImageOperationPage(QWidget):
         self.selected_save_path: Path | None = None
         self.last_output_location: Path | None = None
         self.worker_thread: QThread | None = None
-        self.worker: ProcessingWorker | None = None
+        self.worker: ProcessingWorker | BlindWatermarkExtractionWorker | None = None
         self.processing_active = False
         self.preview_thread: QThread | None = None
         self.preview_worker: PreviewWorker | None = None
@@ -832,6 +937,7 @@ class ImageOperationPage(QWidget):
         self.watermark_image_path: Path | None = None
         self.watermark_drag_delta = (0, 0)
         self.current_preview_image_size: tuple[int, int] | None = None
+        self.blind_watermark_results: dict[Path, str] = {}
         self.feature_enabled = {feature: True for feature in COMPREHENSIVE_FEATURES}
         self.feature_sections: dict[str, QWidget] = {}
 
@@ -843,6 +949,7 @@ class ImageOperationPage(QWidget):
         self._update_compression_controls_state()
         self._update_watermark_controls_state()
         self._update_reference_notice_controls_state()
+        self._update_blind_watermark_controls_state()
         self._update_result_labels(0, 0, 0)
 
     @property
@@ -885,6 +992,21 @@ class ImageOperationPage(QWidget):
     def always_apply_reference_notice(self) -> bool:
         return self.mode == MODE_REFERENCE_NOTICE
 
+    @property
+    def has_optional_blind_watermark(self) -> bool:
+        return self.mode == MODE_COMPREHENSIVE
+
+    @property
+    def always_apply_blind_watermark(self) -> bool:
+        return self.mode == MODE_BLIND_WATERMARK
+
+    def _blind_watermark_is_extracting(self) -> bool:
+        return (
+            self.always_apply_blind_watermark
+            and hasattr(self, "blind_watermark_extract_radio")
+            and self.blind_watermark_extract_radio.isChecked()
+        )
+
     def is_feature_enabled(self, feature: str) -> bool:
         if self.mode != MODE_COMPREHENSIVE:
             return True
@@ -924,6 +1046,8 @@ class ImageOperationPage(QWidget):
             self._update_watermark_controls_state()
         elif feature == MODE_REFERENCE_NOTICE:
             self._update_reference_notice_controls_state()
+        elif feature == MODE_BLIND_WATERMARK:
+            self._update_blind_watermark_controls_state()
         self._refresh_preview()
 
     def _setup_ui(self) -> None:
@@ -1073,16 +1197,22 @@ class ImageOperationPage(QWidget):
             if self.mode == MODE_COMPREHENSIVE:
                 self.feature_sections[MODE_REFERENCE_NOTICE] = self.reference_notice_card
 
+        if self.has_optional_blind_watermark or self.always_apply_blind_watermark:
+            self.blind_watermark_card = self._build_blind_watermark_card()
+            layout.addWidget(self.blind_watermark_card)
+            if self.mode == MODE_COMPREHENSIVE:
+                self.feature_sections[MODE_BLIND_WATERMARK] = self.blind_watermark_card
+
         self.output_card = self._build_output_card()
-        save_card = self._build_save_card()
+        self.save_card = self._build_save_card()
         if self.has_compression_controls:
             layout.addWidget(self.output_card)
-            layout.addWidget(save_card)
+            layout.addWidget(self.save_card)
         else:
             settings_row = QHBoxLayout()
             settings_row.setSpacing(14)
             settings_row.addWidget(self.output_card, 2)
-            settings_row.addWidget(save_card, 2)
+            settings_row.addWidget(self.save_card, 2)
             layout.addLayout(settings_row)
 
         progress_card, progress_layout = self._create_card("处理进度")
@@ -1530,6 +1660,114 @@ class ImageOperationPage(QWidget):
 
         return card
 
+    def _build_blind_watermark_card(self) -> CardWidget:
+        card, layout = self._create_card("盲水印")
+
+        if self.has_optional_blind_watermark:
+            self.blind_watermark_checkbox = CheckBox(self)
+            self.blind_watermark_checkbox.setText("嵌入盲水印")
+            self.blind_watermark_checkbox.setChecked(False)
+            layout.addWidget(self.blind_watermark_checkbox)
+        else:
+            action_row = QHBoxLayout()
+            action_row.setSpacing(14)
+            action_row.addWidget(QLabel("操作", self))
+            self.blind_watermark_action_group = QButtonGroup(self)
+            self.blind_watermark_embed_radio = RadioButton("嵌入盲水印", self)
+            self.blind_watermark_extract_radio = RadioButton("提取盲水印", self)
+            self.blind_watermark_action_group.addButton(self.blind_watermark_embed_radio)
+            self.blind_watermark_action_group.addButton(self.blind_watermark_extract_radio)
+            if DEFAULT_BLIND_WATERMARK_ACTION == BLIND_WATERMARK_ACTION_EXTRACT:
+                self.blind_watermark_extract_radio.setChecked(True)
+            else:
+                self.blind_watermark_embed_radio.setChecked(True)
+            action_row.addWidget(self.blind_watermark_embed_radio)
+            action_row.addWidget(self.blind_watermark_extract_radio)
+            action_row.addStretch(1)
+            layout.addLayout(action_row)
+
+        self.blind_watermark_hint_label = QLabel(
+            "盲水印肉眼通常不可见，用于辅助溯源。建议使用短编号；重编码后能否提取"
+            "取决于图片内容和编码参数，不保证抵抗裁剪、缩放、旋转或生成式重绘。",
+            self,
+        )
+        self.blind_watermark_hint_label.setObjectName("MutedLabel")
+        self.blind_watermark_hint_label.setWordWrap(True)
+        layout.addWidget(self.blind_watermark_hint_label)
+
+        self.blind_watermark_text_container = QWidget(card)
+        text_row = QHBoxLayout(self.blind_watermark_text_container)
+        text_row.setContentsMargins(0, 0, 0, 0)
+        text_row.setSpacing(10)
+        text_row.addWidget(QLabel("水印内容", self.blind_watermark_text_container))
+        self.blind_watermark_text_edit = LineEdit(self.blind_watermark_text_container)
+        self.blind_watermark_text_edit.setText(DEFAULT_BLIND_WATERMARK_TEXT)
+        self.blind_watermark_text_edit.setPlaceholderText("建议填写订单号或短编号")
+        text_row.addWidget(self.blind_watermark_text_edit, 1)
+        self.blind_watermark_bytes_label = QLabel("", self.blind_watermark_text_container)
+        self.blind_watermark_bytes_label.setObjectName("MutedLabel")
+        text_row.addWidget(self.blind_watermark_bytes_label)
+        layout.addWidget(self.blind_watermark_text_container)
+
+        self.blind_watermark_extract_container = QWidget(card)
+        extract_row = QHBoxLayout(self.blind_watermark_extract_container)
+        extract_row.setContentsMargins(0, 0, 0, 0)
+        extract_row.setSpacing(10)
+        extract_row.addWidget(QLabel("水印位数", self.blind_watermark_extract_container))
+        self.blind_watermark_bit_length_edit = LineEdit(self.blind_watermark_extract_container)
+        default_bits = (
+            len(DEFAULT_BLIND_WATERMARK_TEXT.encode("utf-8"))
+            + BLIND_WATERMARK_FRAME_OVERHEAD_BYTES
+        ) * 8
+        self.blind_watermark_bit_length_edit.setText(str(default_bits))
+        self.blind_watermark_bit_length_edit.setFixedWidth(100)
+        extract_row.addWidget(self.blind_watermark_bit_length_edit)
+        extract_hint = QLabel("必须与嵌入时显示的提取位数一致", self.blind_watermark_extract_container)
+        extract_hint.setObjectName("MutedLabel")
+        extract_row.addWidget(extract_hint)
+        extract_row.addStretch(1)
+        layout.addWidget(self.blind_watermark_extract_container)
+
+        key_row = QHBoxLayout()
+        key_row.setSpacing(10)
+        key_row.addWidget(QLabel("图像密钥", self))
+        self.blind_watermark_image_key_edit = LineEdit(self)
+        self.blind_watermark_image_key_edit.setText(str(DEFAULT_BLIND_WATERMARK_IMAGE_KEY))
+        self.blind_watermark_image_key_edit.setFixedWidth(130)
+        key_row.addWidget(self.blind_watermark_image_key_edit)
+        key_row.addWidget(QLabel("内容密钥", self))
+        self.blind_watermark_content_key_edit = LineEdit(self)
+        self.blind_watermark_content_key_edit.setText(str(DEFAULT_BLIND_WATERMARK_CONTENT_KEY))
+        self.blind_watermark_content_key_edit.setFixedWidth(130)
+        key_row.addWidget(self.blind_watermark_content_key_edit)
+        key_row.addStretch(1)
+        layout.addLayout(key_row)
+
+        if self.always_apply_blind_watermark:
+            self.blind_watermark_result_container = QWidget(card)
+            result_layout = QVBoxLayout(self.blind_watermark_result_container)
+            result_layout.setContentsMargins(0, 0, 0, 0)
+            result_header = QHBoxLayout()
+            result_header.addWidget(QLabel("提取结果", self.blind_watermark_result_container))
+            result_header.addStretch(1)
+            self.blind_watermark_copy_result_button = self._create_button(
+                PushButton,
+                "复制结果",
+                FIF.COPY,
+            )
+            self.blind_watermark_copy_result_button.setEnabled(False)
+            result_header.addWidget(self.blind_watermark_copy_result_button)
+            result_layout.addLayout(result_header)
+            self.blind_watermark_result_edit = PlainTextEdit(self.blind_watermark_result_container)
+            self.blind_watermark_result_edit.setReadOnly(True)
+            self.blind_watermark_result_edit.setPlaceholderText("选择已成功提取的图片查看完整内容")
+            self.blind_watermark_result_edit.setFixedHeight(92)
+            result_layout.addWidget(self.blind_watermark_result_edit)
+            layout.addWidget(self.blind_watermark_result_container)
+
+        self._update_blind_watermark_byte_count()
+        return card
+
     def _build_save_card(self) -> CardWidget:
         card, layout = self._create_card("保存方式")
         self.save_group = QButtonGroup(self)
@@ -1701,6 +1939,31 @@ class ImageOperationPage(QWidget):
             )
             self.reference_notice_opacity_edit.textChanged.connect(
                 self._refresh_preview
+            )
+        if self.has_optional_blind_watermark:
+            self.blind_watermark_checkbox.stateChanged.connect(
+                self._update_blind_watermark_controls_state
+            )
+            self.blind_watermark_checkbox.stateChanged.connect(self._refresh_preview)
+        if self.has_optional_blind_watermark or self.always_apply_blind_watermark:
+            self.blind_watermark_text_edit.textChanged.connect(
+                self._update_blind_watermark_byte_count
+            )
+            self.blind_watermark_image_key_edit.textChanged.connect(self._refresh_preview)
+            self.blind_watermark_content_key_edit.textChanged.connect(self._refresh_preview)
+        if self.always_apply_blind_watermark:
+            self.blind_watermark_embed_radio.toggled.connect(
+                self._on_blind_watermark_action_changed
+            )
+            self.blind_watermark_extract_radio.toggled.connect(
+                self._on_blind_watermark_action_changed
+            )
+            self.blind_watermark_bit_length_edit.textChanged.connect(self._refresh_preview)
+            self.blind_watermark_copy_result_button.clicked.connect(
+                self._copy_blind_watermark_result
+            )
+            self.table.itemSelectionChanged.connect(
+                self._update_blind_watermark_result_view
             )
 
     def _toggle_preview_sidebar(self, *_args) -> None:
@@ -2012,6 +2275,122 @@ class ImageOperationPage(QWidget):
         self.reference_notice_position_combo.setEnabled(enabled)
         self.reference_notice_opacity_edit.setEnabled(enabled)
 
+    def _get_apply_blind_watermark(self) -> bool:
+        if not self.is_feature_enabled(MODE_BLIND_WATERMARK):
+            return False
+        if self.always_apply_blind_watermark:
+            return not self._blind_watermark_is_extracting()
+        if self.has_optional_blind_watermark:
+            return self.blind_watermark_checkbox.isChecked()
+        return False
+
+    def _update_blind_watermark_byte_count(self, *_args) -> None:
+        if not hasattr(self, "blind_watermark_text_edit"):
+            return
+        byte_count = len(self.blind_watermark_text_edit.text().strip().encode("utf-8"))
+        bit_length = (byte_count + BLIND_WATERMARK_FRAME_OVERHEAD_BYTES) * 8
+        self.blind_watermark_bytes_label.setText(
+            f"{byte_count}/{MAX_BLIND_WATERMARK_TEXT_BYTES} 字节 · 提取位数 {bit_length}"
+        )
+        if hasattr(self, "blind_watermark_bit_length_edit") and byte_count:
+            self.blind_watermark_bit_length_edit.setPlaceholderText(str(bit_length))
+
+    def _on_blind_watermark_action_changed(self, checked: bool) -> None:
+        if not checked:
+            return
+        self._update_blind_watermark_controls_state()
+        self._refresh_preview()
+
+    def _update_blind_watermark_controls_state(self, *_args) -> None:
+        if not (
+            self.has_optional_blind_watermark
+            or self.always_apply_blind_watermark
+        ):
+            return
+
+        extracting = self._blind_watermark_is_extracting()
+        active = (
+            self._get_apply_blind_watermark()
+            or extracting
+        )
+        enabled = active and not self.processing_active
+        if self.has_optional_blind_watermark:
+            self.blind_watermark_checkbox.setEnabled(not self.processing_active)
+        if self.always_apply_blind_watermark:
+            self.blind_watermark_embed_radio.setEnabled(not self.processing_active)
+            self.blind_watermark_extract_radio.setEnabled(not self.processing_active)
+            self.blind_watermark_extract_container.setVisible(extracting)
+            self.blind_watermark_result_container.setVisible(extracting)
+            self.output_card.setVisible(not extracting)
+            self.save_card.setVisible(not extracting)
+            self.open_location_button.setVisible(not extracting)
+            self.start_button.setText("开始提取" if extracting else "开始嵌入")
+        else:
+            self.blind_watermark_extract_container.setVisible(False)
+        self.blind_watermark_text_container.setVisible(not extracting)
+        self.blind_watermark_text_edit.setEnabled(enabled and not extracting)
+        self.blind_watermark_image_key_edit.setEnabled(enabled)
+        self.blind_watermark_content_key_edit.setEnabled(enabled)
+        if hasattr(self, "blind_watermark_bit_length_edit"):
+            self.blind_watermark_bit_length_edit.setEnabled(enabled and extracting)
+        self._update_blind_watermark_result_view()
+
+    def _blind_watermark_passwords(self) -> tuple[int | None, int | None, str | None]:
+        image_key = self._read_int_value(
+            self.blind_watermark_image_key_edit,
+            MIN_BLIND_WATERMARK_KEY,
+            MAX_BLIND_WATERMARK_KEY,
+        )
+        if image_key is None:
+            return None, None, "请输入正确的盲水印图像密钥"
+        content_key = self._read_int_value(
+            self.blind_watermark_content_key_edit,
+            MIN_BLIND_WATERMARK_KEY,
+            MAX_BLIND_WATERMARK_KEY,
+        )
+        if content_key is None:
+            return None, None, "请输入正确的盲水印内容密钥"
+        return image_key, content_key, None
+
+    def _get_blind_watermark_options(
+        self,
+    ) -> tuple[BlindWatermarkOptions | None, str | None]:
+        if not self._get_apply_blind_watermark():
+            return None, None
+        image_key, content_key, key_error = self._blind_watermark_passwords()
+        if key_error:
+            return None, key_error
+        try:
+            return (
+                BlindWatermarkOptions(
+                    text=self.blind_watermark_text_edit.text(),
+                    password_image=image_key,
+                    password_watermark=content_key,
+                ),
+                None,
+            )
+        except (ValueError, RuntimeError) as exc:
+            return None, str(exc)
+
+    def _get_blind_watermark_extraction_parameters(
+        self,
+    ) -> tuple[tuple[int, int, int] | None, str | None]:
+        image_key, content_key, key_error = self._blind_watermark_passwords()
+        if key_error:
+            return None, key_error
+        bit_length = self._read_int_value(
+            self.blind_watermark_bit_length_edit,
+            MIN_BLIND_WATERMARK_BIT_LENGTH,
+            MAX_BLIND_WATERMARK_BIT_LENGTH,
+        )
+        if bit_length is None or bit_length % BLIND_WATERMARK_BIT_LENGTH_STEP:
+            return None, (
+                f"水印位数必须是 {MIN_BLIND_WATERMARK_BIT_LENGTH} 到 "
+                f"{MAX_BLIND_WATERMARK_BIT_LENGTH} 之间的 "
+                f"{BLIND_WATERMARK_BIT_LENGTH_STEP} 的倍数"
+            )
+        return (bit_length, image_key, content_key), None
+
     def _refresh_preview(self, *_args) -> None:
         if not hasattr(self, "preview_image_label"):
             return
@@ -2068,6 +2447,13 @@ class ImageOperationPage(QWidget):
             self._set_preview_message(reference_notice_error)
             return
 
+        blind_watermark_options, blind_watermark_error = (
+            self._get_blind_watermark_options()
+        )
+        if blind_watermark_error and not self._blind_watermark_is_extracting():
+            self._set_preview_message(blind_watermark_error)
+            return
+
         try:
             item = self.items[row]
             output_format, _ = resolve_output_format(self._get_output_choice(), item.path)
@@ -2085,6 +2471,7 @@ class ImageOperationPage(QWidget):
                     logos=[],
                     watermark_options=watermark_options,
                     reference_notice_options=reference_notice_options,
+                    blind_watermark_options=blind_watermark_options,
                 ),
                 logo_assets=list(logo_assets),
             )
@@ -2093,7 +2480,12 @@ class ImageOperationPage(QWidget):
             return
 
         self.pending_preview_request = request
-        self.preview_info_label.setText("正在生成预览…")
+        if self._blind_watermark_is_extracting():
+            self.preview_info_label.setText("原图预览 · 等待提取盲水印")
+        elif blind_watermark_options is not None:
+            self.preview_info_label.setText("正在生成视觉预览…盲水印将在保存时嵌入")
+        else:
+            self.preview_info_label.setText("正在生成预览…")
         self.preview_timer.start()
 
     def _start_pending_preview(self) -> None:
@@ -2228,6 +2620,10 @@ class ImageOperationPage(QWidget):
             else:
                 detail_parts.append("编码：PNG 无损")
             lines.append("    ".join(detail_parts))
+        if self._blind_watermark_is_extracting():
+            lines.append("提取模式：不会创建或修改图片文件")
+        elif self._get_apply_blind_watermark():
+            lines.append("盲水印将在最终保存前嵌入，视觉预览不显示其像素扰动")
         self.preview_info_label.setText("\n".join(lines))
 
     def _on_preview_watermark_drag_started(self, x: int, y: int) -> None:
@@ -2326,6 +2722,8 @@ class ImageOperationPage(QWidget):
     def _remove_selected(self, *_args) -> None:
         rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()}, reverse=True)
         for row in rows:
+            if 0 <= row < len(self.items):
+                self.blind_watermark_results.pop(self.items[row].path.resolve(), None)
             self.table.removeRow(row)
             del self.items[row]
         if rows:
@@ -2336,12 +2734,14 @@ class ImageOperationPage(QWidget):
 
     def _clear_list(self, *_args) -> None:
         self.items.clear()
+        self.blind_watermark_results.clear()
         self.table.setRowCount(0)
         self._reset_save_location()
         self._update_result_labels(0, 0, 0)
         self.progress_bar.setValue(0)
         self.progress_text.setText("总数：0    当前：0/0    文件：-")
         self._refresh_preview()
+        self._update_blind_watermark_result_view()
 
     def _update_custom_size_state(self, *_args) -> None:
         if not self.has_size_controls:
@@ -2485,6 +2885,10 @@ class ImageOperationPage(QWidget):
             self._show_message("warning", "请先导入图片")
             return
 
+        if self._blind_watermark_is_extracting():
+            self._start_blind_watermark_extraction()
+            return
+
         settings = self._get_page_settings()
         if settings is None:
             return
@@ -2499,6 +2903,9 @@ class ImageOperationPage(QWidget):
 
         for row in range(self.table.rowCount()):
             self._set_row_status(row, STATUS_PENDING)
+            status_item = self.table.item(row, STATUS_COLUMN)
+            if status_item is not None:
+                status_item.setToolTip("")
 
         self._set_processing_state(True)
         self._update_result_labels(len(tasks), 0, 0)
@@ -2515,6 +2922,7 @@ class ImageOperationPage(QWidget):
             logo_cache=logo_cache,
             watermark_options=settings.watermark_options,
             reference_notice_options=settings.reference_notice_options,
+            blind_watermark_options=settings.blind_watermark_options,
         )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
@@ -2529,15 +2937,117 @@ class ImageOperationPage(QWidget):
         self.worker_thread.finished.connect(self._clear_worker_refs)
         self.worker_thread.start()
 
+    def _start_blind_watermark_extraction(self) -> None:
+        parameters, error = self._get_blind_watermark_extraction_parameters()
+        if error or parameters is None:
+            self._show_message("warning", error or "请输入正确的盲水印提取参数")
+            return
+        bit_length, image_key, content_key = parameters
+        tasks = [
+            BlindWatermarkExtractionTask(row=row, source_path=item.path)
+            for row, item in enumerate(self.items)
+        ]
+        self.blind_watermark_results.clear()
+        self.blind_watermark_result_edit.clear()
+        self.blind_watermark_copy_result_button.setEnabled(False)
+        for row in range(self.table.rowCount()):
+            self._set_row_status(row, STATUS_PENDING)
+            status_item = self.table.item(row, STATUS_COLUMN)
+            if status_item is not None:
+                status_item.setToolTip("")
+
+        self._set_processing_state(True)
+        self._update_result_labels(len(tasks), 0, 0)
+        self.progress_bar.setValue(0)
+        self.progress_text.setText(
+            f"总数：{len(tasks)}    当前：0/{len(tasks)}    文件：-"
+        )
+        self.last_output_location = None
+        self.open_location_button.setEnabled(False)
+
+        self.worker_thread = QThread(self)
+        self.worker = BlindWatermarkExtractionWorker(
+            tasks,
+            bit_length=bit_length,
+            password_image=image_key,
+            password_watermark=content_key,
+        )
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.item_started.connect(self._on_item_started)
+        self.worker.item_finished.connect(self._on_item_finished)
+        self.worker.extracted.connect(self._on_blind_watermark_extracted)
+        self.worker.progress_changed.connect(self._on_progress_changed)
+        self.worker.finished.connect(self._on_blind_watermark_extraction_finished)
+        self.worker.finished.connect(lambda *_: self.worker_thread.quit())
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.worker_thread.finished.connect(self._clear_worker_refs)
+        self.worker_thread.start()
+
     def _cancel_processing(self, *_args) -> None:
         if self.worker is None:
             return
         self.worker.request_cancel()
         self.cancel_button.setEnabled(False)
-        self.progress_text.setText(self.progress_text.text() + "    正在取消")
+        self.progress_text.setText(
+            self.progress_text.text() + "    正在取消（当前图片完成后停止）"
+        )
 
     def _forward_output_committed(self, output: object) -> None:
         self.output_committed.emit(output)
+
+    def _on_blind_watermark_extracted(self, row: int, text: str) -> None:
+        if row < 0 or row >= len(self.items):
+            return
+        self.blind_watermark_results[self.items[row].path.resolve()] = text
+        status_item = self.table.item(row, STATUS_COLUMN)
+        if status_item is not None:
+            status_item.setToolTip(text)
+        self._update_blind_watermark_result_view()
+
+    def _on_blind_watermark_extraction_finished(
+        self,
+        total: int,
+        success: int,
+        failure: int,
+        _last_output_dir: object,
+        canceled: bool,
+    ) -> None:
+        self._update_result_labels(total, success, failure)
+        if not canceled:
+            self.progress_bar.setValue(100 if total else 0)
+        self.last_output_location = None
+        self.open_location_button.setEnabled(False)
+        if canceled:
+            self._show_message("warning", "盲水印提取已取消")
+        elif failure:
+            self._show_message("warning", "部分图片的盲水印提取失败")
+        else:
+            self._show_message("success", "盲水印提取完成")
+
+    def _update_blind_watermark_result_view(self, *_args) -> None:
+        if not hasattr(self, "blind_watermark_result_edit"):
+            return
+        rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        text = ""
+        if rows:
+            row = rows[0].row()
+            if 0 <= row < len(self.items):
+                text = self.blind_watermark_results.get(
+                    self.items[row].path.resolve(),
+                    "",
+                )
+        self.blind_watermark_result_edit.setPlainText(text)
+        self.blind_watermark_copy_result_button.setEnabled(bool(text))
+
+    def _copy_blind_watermark_result(self, *_args) -> None:
+        text = self.blind_watermark_result_edit.toPlainText()
+        if not text:
+            self._show_message("warning", "当前没有可复制的提取结果")
+            return
+        QApplication.clipboard().setText(text)
+        self._show_message("success", "提取结果已复制")
 
     def _get_page_settings(self) -> PageSettings | None:
         output_size = self._get_output_size()
@@ -2581,6 +3091,13 @@ class ImageOperationPage(QWidget):
             self._show_message("warning", reference_notice_error)
             return None
 
+        blind_watermark_options, blind_watermark_error = (
+            self._get_blind_watermark_options()
+        )
+        if blind_watermark_error:
+            self._show_message("warning", blind_watermark_error)
+            return None
+
         return PageSettings(
             output_size=output_size,
             output_choice=self._get_output_choice(),
@@ -2589,6 +3106,7 @@ class ImageOperationPage(QWidget):
             logo_assets=logo_assets,
             watermark_options=watermark_options,
             reference_notice_options=reference_notice_options,
+            blind_watermark_options=blind_watermark_options,
         )
 
     def _prepare_tasks(self, settings: PageSettings) -> list[ProcessingTask]:
@@ -2982,6 +3500,8 @@ class ImageOperationPage(QWidget):
             self._update_watermark_controls_state()
         if self.has_optional_reference_notice or self.always_apply_reference_notice:
             self._update_reference_notice_controls_state()
+        if self.has_optional_blind_watermark or self.always_apply_blind_watermark:
+            self._update_blind_watermark_controls_state()
         for button in self.save_group.buttons():
             button.setEnabled(not processing)
         self.choose_save_button.setEnabled(not processing and self.choose_save_radio.isChecked())
@@ -4177,13 +4697,21 @@ class AboutActionButton(PushButton):
 
 
 class OpenSourceLicenseDialog(MessageBoxBase):
-    def __init__(self, license_text: str, parent: QWidget) -> None:
+    def __init__(
+        self,
+        license_text: str,
+        parent: QWidget,
+        *,
+        title: str = "开源字体许可",
+        summary: str | None = None,
+    ) -> None:
         super().__init__(parent)
         self.widget.setMinimumWidth(720)
 
-        title_label = SubtitleLabel("开源字体许可", self.widget)
+        title_label = SubtitleLabel(title, self.widget)
         summary_label = BodyLabel(
-            f"{REFERENCE_NOTICE_FONT_NAME} · Adobe Source Han Sans · "
+            summary
+            or f"{REFERENCE_NOTICE_FONT_NAME} · Adobe Source Han Sans · "
             "SIL Open Font License 1.1",
             self.widget,
         )
@@ -4282,12 +4810,28 @@ class AboutPage(QWidget):
         font_license_row.addWidget(self.font_license_label)
         font_license_row.addStretch(1)
         font_license_row.addWidget(self.font_license_button)
+        blind_watermark_license_row = QHBoxLayout()
+        blind_watermark_license_row.setSpacing(10)
+        self.blind_watermark_license_label = QLabel(
+            "盲水印组件：blind-watermark 0.4.4 · MIT License",
+            self.about_panel,
+        )
+        self.blind_watermark_license_label.setObjectName("MutedLabel")
+        self.blind_watermark_license_button = PushButton(
+            "查看开源许可",
+            self.about_panel,
+        )
+        self.blind_watermark_license_button.setIcon(FIF.DOCUMENT)
+        blind_watermark_license_row.addWidget(self.blind_watermark_license_label)
+        blind_watermark_license_row.addStretch(1)
+        blind_watermark_license_row.addWidget(self.blind_watermark_license_button)
         panel_layout.addWidget(self.privacy_title_label)
         panel_layout.addWidget(self.privacy_lead_label)
         panel_layout.addWidget(self.no_overwrite_label)
         panel_layout.addWidget(self.no_path_storage_label)
         panel_layout.addWidget(self.memo_storage_label)
         panel_layout.addLayout(font_license_row)
+        panel_layout.addLayout(blind_watermark_license_row)
 
         self.divider = QFrame(self.about_panel)
         self.divider.setObjectName("AboutDivider")
@@ -4365,6 +4909,9 @@ class AboutPage(QWidget):
         )
         self.copy_version_action.clicked.connect(self._copy_version_information)
         self.font_license_button.clicked.connect(self._show_font_license)
+        self.blind_watermark_license_button.clicked.connect(
+            self._show_blind_watermark_license
+        )
         self.apply_theme_styles()
 
     @staticmethod
@@ -4391,6 +4938,23 @@ class AboutPage(QWidget):
             self._show_message("error", "开源字体许可证文件无法读取")
             return
         OpenSourceLicenseDialog(license_text, self.window()).exec()
+
+    def _show_blind_watermark_license(self) -> None:
+        license_path = resource_path(BLIND_WATERMARK_LICENSE_RELATIVE_PATH)
+        try:
+            license_text = license_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            self._show_message("error", "盲水印组件许可证文件缺失")
+            return
+        except (OSError, UnicodeError):
+            self._show_message("error", "盲水印组件许可证文件无法读取")
+            return
+        OpenSourceLicenseDialog(
+            license_text,
+            self.window(),
+            title="盲水印组件许可",
+            summary="blind-watermark 0.4.4 · MIT License",
+        ).exec()
 
     def _show_message(self, level: str, content: str) -> None:
         kwargs = dict(
@@ -4455,6 +5019,11 @@ class ImageToolWindow(FluentWindow):
             MODE_REFERENCE_NOTICE,
             "referenceNoticePage",
         )
+        self.blind_watermark_page = ImageOperationPage(
+            "盲水印",
+            MODE_BLIND_WATERMARK,
+            "blindWatermarkPage",
+        )
         self.memo_page = MemoPage(self.settings)
         self.settings_page = SettingsPage(
             self.theme_value,
@@ -4474,6 +5043,7 @@ class ImageToolWindow(FluentWindow):
             MODE_LOGO: self.logo_page,
             MODE_WATERMARK: self.watermark_page,
             MODE_REFERENCE_NOTICE: self.reference_notice_page,
+            MODE_BLIND_WATERMARK: self.blind_watermark_page,
             MODE_MEMO: self.memo_page,
         }
         self.operation_pages = [
@@ -4484,6 +5054,7 @@ class ImageToolWindow(FluentWindow):
             self.logo_page,
             self.watermark_page,
             self.reference_notice_page,
+            self.blind_watermark_page,
         ]
         self.theme_pages = [
             *self.operation_pages,
@@ -4506,6 +5077,7 @@ class ImageToolWindow(FluentWindow):
             (MODE_LOGO, self.logo_page, FIF.EDIT),
             (MODE_WATERMARK, self.watermark_page, FIF.TAG),
             (MODE_REFERENCE_NOTICE, self.reference_notice_page, FIF.LABEL),
+            (MODE_BLIND_WATERMARK, self.blind_watermark_page, FIF.FINGERPRINT),
             (MODE_MEMO, self.memo_page, FIF.QUICK_NOTE),
         )
         self.feature_nav_items = {}

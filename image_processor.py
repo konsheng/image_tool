@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import dataclass, replace
 from io import BytesIO
 from math import cos, pi, sin
@@ -7,6 +9,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
+from blind_watermark_service import BlindWatermarkOptions, embed_blind_watermark
 from compressor import CompressionResult, save_image_to_bytes
 from config import (
     DEFAULT_REFERENCE_NOTICE_BACKGROUND_OPACITY,
@@ -110,6 +113,7 @@ class ProcessOptions:
     watermark_options: WatermarkOptions | None = None
     quality: int | None = None
     reference_notice_options: ReferenceNoticeOptions | None = None
+    blind_watermark_options: BlindWatermarkOptions | None = None
 
     def __post_init__(self) -> None:
         if self.output_size is not None:
@@ -154,10 +158,14 @@ def get_image_info(path: str | Path) -> ImageInfo:
 def process_image(source_path: str | Path, output_path: str | Path, options: ProcessOptions) -> ProcessResult:
     target = Path(output_path)
     working = _render_working_image(source_path, options)
+    if options.blind_watermark_options is not None:
+        working = embed_blind_watermark(
+            working,
+            options.blind_watermark_options,
+        )
     compression = _encode_working_image(working, options)
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(compression.data)
+    _atomic_write_bytes(target, compression.data)
 
     return ProcessResult(
         output_path=target,
@@ -165,6 +173,31 @@ def process_image(source_path: str | Path, output_path: str | Path, options: Pro
         compression=compression,
         dimensions=working.size,
     )
+
+
+def _atomic_write_bytes(target: Path, data: bytes) -> None:
+    """Commit encoded output without exposing a partial destination file."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            descriptor = -1
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, target)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary_path.unlink()
+        except OSError:
+            pass
 
 
 def render_preview_image(source_path: str | Path, options: ProcessOptions) -> Image.Image:

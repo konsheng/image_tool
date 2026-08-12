@@ -39,6 +39,7 @@ from gui import (
     ImageOperationPage,
     ImageToolWindow,
     LOGO_RULE_CUSTOM,
+    MODE_BLIND_WATERMARK,
     MODE_COMPRESS,
     MODE_COMPREHENSIVE,
     MODE_FORMAT,
@@ -185,6 +186,7 @@ class GuiFeatureTestCase(unittest.TestCase):
                     MODE_LOGO: False,
                     MODE_WATERMARK: False,
                     MODE_REFERENCE_NOTICE: False,
+                    MODE_BLIND_WATERMARK: False,
                 }
                 for feature, enabled in expected_page_states.items():
                     window.settings_page.feature_switches[feature].setChecked(enabled)
