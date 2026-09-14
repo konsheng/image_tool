@@ -20,13 +20,6 @@ if not exist "assets\fonts\LICENSE.txt" (
     exit /b 1
 )
 
-python -c "import blind_watermark, cv2, numpy, pywt; assert blind_watermark.__version__ == '0.4.4'" >nul 2>&1
-if errorlevel 1 (
-    echo Blind watermark dependencies are not installed.
-    echo Please run: pip install -r requirements.txt
-    exit /b 1
-)
-
 python -m PyInstaller --noconfirm --clean image_tool.spec
 set "build_exit_code=%ERRORLEVEL%"
 endlocal & exit /b %build_exit_code%

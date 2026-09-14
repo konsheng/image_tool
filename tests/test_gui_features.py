@@ -39,7 +39,7 @@ from gui import (
     ImageOperationPage,
     ImageToolWindow,
     LOGO_RULE_CUSTOM,
-    MODE_BLIND_WATERMARK,
+    MEMO_STORAGE_DIRECTORY_SETTING_KEY,
     MODE_COMPRESS,
     MODE_COMPREHENSIVE,
     MODE_FORMAT,
@@ -50,6 +50,10 @@ from gui import (
     PageSettings,
     PreviewRequest,
     PreviewWorker,
+    STATISTICS_OUTPUT_BYTES_KEY,
+    STATISTICS_PROCESSED_COUNT_KEY,
+    STATISTICS_SOURCE_BYTES_KEY,
+    THEME_SETTING_KEY,
     comprehensive_feature_setting_key,
     feature_setting_key,
     resource_path,
@@ -186,7 +190,6 @@ class GuiFeatureTestCase(unittest.TestCase):
                     MODE_LOGO: False,
                     MODE_WATERMARK: False,
                     MODE_REFERENCE_NOTICE: False,
-                    MODE_BLIND_WATERMARK: False,
                 }
                 for feature, enabled in expected_page_states.items():
                     window.settings_page.feature_switches[feature].setChecked(enabled)
@@ -646,6 +649,72 @@ class GuiFeatureTestCase(unittest.TestCase):
             page.deleteLater()
             self.process_events()
 
+    def test_startup_removes_only_retired_feature_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings_path = root / "settings.ini"
+            memo_directory = root / "memos"
+            memo_directory.mkdir()
+            legacy_settings = QSettings(str(settings_path), QSettings.IniFormat)
+            preserved = {
+                THEME_SETTING_KEY: "dark",
+                MEMO_STORAGE_DIRECTORY_SETTING_KEY: str(memo_directory),
+                STATISTICS_PROCESSED_COUNT_KEY: "12",
+                STATISTICS_SOURCE_BYTES_KEY: "9000",
+                STATISTICS_OUTPUT_BYTES_KEY: "4000",
+                feature_setting_key(MODE_RESIZE): "false",
+                feature_setting_key(MODE_WATERMARK): "true",
+                comprehensive_feature_setting_key(MODE_RESIZE): "true",
+                comprehensive_feature_setting_key(MODE_WATERMARK): "false",
+                "features/blind_watermark_archive/enabled": "keep-page-neighbor",
+                "comprehensive_features/blind_watermark_backup/enabled": "keep-card-neighbor",
+                "custom/setting": "keep-unrelated",
+            }
+            obsolete_groups = (
+                "features/blind_watermark",
+                "comprehensive_features/blind_watermark",
+            )
+            for key, value in preserved.items():
+                legacy_settings.setValue(key, value)
+            for group in obsolete_groups:
+                legacy_settings.setValue(group, "old-value")
+                legacy_settings.setValue(f"{group}/enabled", True)
+                legacy_settings.setValue(f"{group}/nested/value", "old-nested-value")
+            legacy_settings.sync()
+
+            window, settings = self.make_window(settings_path)
+            try:
+                self.assertEqual(len(window.operation_pages), 7)
+                self.assertNotIn("blind_watermark", window.feature_states)
+                self.assertNotIn("blind_watermark", window.comprehensive_feature_states)
+                self.assertNotIn("blind_watermark", window.feature_pages)
+                self.assertNotIn("blind_watermark", window.feature_nav_items)
+                self.assertNotIn("blind_watermark", window.comprehensive_page.feature_sections)
+                self.assertEqual(window.theme_value, "dark")
+                self.assertEqual(window.processing_statistics.processed_count, 12)
+                self.assertEqual(window.processing_statistics.source_bytes, 9000)
+                self.assertEqual(window.processing_statistics.output_bytes, 4000)
+                self.assertFalse(window.feature_states[MODE_RESIZE])
+                self.assertTrue(window.feature_states[MODE_WATERMARK])
+                self.assertTrue(window.comprehensive_feature_states[MODE_RESIZE])
+                self.assertFalse(window.comprehensive_feature_states[MODE_WATERMARK])
+                for key, value in preserved.items():
+                    self.assertEqual(settings.value(key), value, key)
+                for group in obsolete_groups:
+                    self.assertFalse(
+                        any(key == group or key.startswith(f"{group}/") for key in settings.allKeys())
+                    )
+            finally:
+                self.close_window(window)
+
+            restored = QSettings(str(settings_path), QSettings.IniFormat)
+            for key, value in preserved.items():
+                self.assertEqual(restored.value(key), value, key)
+            for group in obsolete_groups:
+                self.assertFalse(
+                    any(key == group or key.startswith(f"{group}/") for key in restored.allKeys())
+                )
+
     def test_legacy_global_switches_are_migrated_once_then_decoupled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings_path = Path(temp_dir) / "settings.ini"
@@ -826,7 +895,7 @@ class GuiFeatureTestCase(unittest.TestCase):
                 )
 
                 page.original_save_radio.setChecked(True)
-                settings = PageSettings(
+                default_settings = PageSettings(
                     output_size=None,
                     output_choice="保持原格式",
                     quality=None,
@@ -835,9 +904,58 @@ class GuiFeatureTestCase(unittest.TestCase):
                     watermark_options=None,
                     reference_notice_options=None,
                 )
-                tasks = page._prepare_tasks(settings)
+                default_tasks = page._prepare_tasks(default_settings)
 
-                self.assertEqual(tasks[0].output_path.name, "原图_生润食品_冰润鲜.jpg")
+                self.assertEqual(
+                    default_tasks[0].output_path.name,
+                    "原图_生润食品_冰润鲜.jpg",
+                )
+
+                page.choose_save_radio.setChecked(True)
+                page.filename_suffix_edit.setText("_电商图")
+                with patch(
+                    "gui.QFileDialog.getSaveFileName",
+                    side_effect=choose_default_path,
+                ):
+                    self.assertTrue(page._choose_save_location())
+
+                self.assertEqual(
+                    chosen_default_path[1].name,
+                    "原图_电商图.jpg",
+                )
+
+                self.assertIsNotNone(page.selected_save_path)
+                page.filename_suffix_edit.setText("新版")
+                self.assertIsNone(page.selected_save_path)
+                page.filename_suffix_edit.setText("电商图")
+
+                manual_path = Path(temp_dir) / "完全手工命名.jpg"
+                with patch(
+                    "gui.QFileDialog.getSaveFileName",
+                    return_value=(str(manual_path), ""),
+                ):
+                    self.assertTrue(page._choose_save_location())
+
+                custom_settings = PageSettings(
+                    output_size=None,
+                    output_choice="保持原格式",
+                    quality=None,
+                    apply_logo=True,
+                    logo_assets=assets,
+                    watermark_options=None,
+                    reference_notice_options=None,
+                    filename_suffix="电商图",
+                )
+                manual_tasks = page._prepare_tasks(custom_settings)
+                self.assertEqual(manual_tasks[0].output_path.name, "完全手工命名.jpg")
+
+                page.original_save_radio.setChecked(True)
+                custom_tasks = page._prepare_tasks(custom_settings)
+
+                self.assertEqual(
+                    custom_tasks[0].output_path.name,
+                    "原图_电商图.jpg",
+                )
                 self.assertEqual([asset.name for asset in assets], ["01生润食品", "02冰润鲜"])
         finally:
             page.shutdown()
@@ -885,8 +1003,11 @@ class GuiFeatureTestCase(unittest.TestCase):
                 page.reference_notice_position_combo.currentData(),
                 selected_position,
             )
+            self.assertTrue(page.filename_suffix_edit.isEnabled())
             page._set_processing_state(True)
+            self.assertFalse(page.filename_suffix_edit.isEnabled())
             page._set_processing_state(False)
+            self.assertTrue(page.filename_suffix_edit.isEnabled())
             page.set_feature_enabled(MODE_COMPRESS, True)
             page.set_feature_enabled(MODE_WATERMARK, True)
             page.set_feature_enabled(MODE_REFERENCE_NOTICE, True)
@@ -924,6 +1045,114 @@ class GuiFeatureTestCase(unittest.TestCase):
             self.assertEqual(
                 page.reference_notice_position_combo.currentData(),
                 selected_position,
+            )
+        finally:
+            page.shutdown()
+            page.close()
+            page.deleteLater()
+            self.process_events()
+
+    def test_invalid_filename_suffix_blocks_page_settings(self) -> None:
+        page = ImageOperationPage("图片压缩", MODE_COMPRESS, "filenameSuffixValidationTest")
+        try:
+            page.filename_suffix_edit.setText("推广/主图")
+            with patch.object(page, "_show_message") as show_message:
+                self.assertIsNone(page._get_page_settings())
+
+            show_message.assert_called_once_with(
+                "warning",
+                '文件名后缀不能包含 \\ / : * ? " < > |',
+            )
+        finally:
+            page.shutdown()
+            page.close()
+            page.deleteLater()
+            self.process_events()
+
+    def test_multi_image_suffix_replaces_logos_and_precedes_collision_number(self) -> None:
+        page = ImageOperationPage("LOGO", MODE_LOGO, "batchFilenameSuffixTest")
+        assets = [
+            LogoAsset(name="01生润食品", path=Path("01生润食品.png")),
+            LogoAsset(name="02冰润鲜", path=Path("02冰润鲜.png")),
+        ]
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                page.items = [
+                    ImageListItem(
+                        path=root / directory / "原图.jpg",
+                        image_format="JPG",
+                        dimensions="100 × 100",
+                        size_text="1KB",
+                        logo_rule=LOGO_RULE_CUSTOM,
+                        logo_assets=[asset],
+                    )
+                    for directory, asset in zip(
+                        ("one", "two", "three"),
+                        (assets[0], assets[0], assets[1]),
+                    )
+                ]
+                output_directory = root / "output"
+                page.choose_save_radio.setChecked(True)
+                page.selected_save_path = output_directory
+                page.filename_suffix_edit.setText("电商图")
+                self.assertEqual(page.selected_save_path, output_directory)
+
+                settings = PageSettings(
+                    output_size=None,
+                    output_choice="保持原格式",
+                    quality=None,
+                    apply_logo=True,
+                    logo_assets=assets,
+                    watermark_options=None,
+                    filename_suffix="电商图",
+                )
+                tasks = page._prepare_tasks(settings)
+
+                self.assertEqual(
+                    [task.output_path.name for task in tasks],
+                    [
+                        "原图_电商图.jpg",
+                        "原图_电商图_1.jpg",
+                        "原图_电商图_2.jpg",
+                    ],
+                )
+                self.assertTrue(
+                    all(task.output_path.parent == output_directory for task in tasks)
+                )
+        finally:
+            page.shutdown()
+            page.close()
+            page.deleteLater()
+            self.process_events()
+
+    def test_oversized_automatic_filename_is_reported_before_processing(self) -> None:
+        page = ImageOperationPage("图片压缩", MODE_COMPRESS, "longOutputFilenameTest")
+        try:
+            page.items = [
+                ImageListItem(
+                    path=Path(f"{'😀' * 126}.jpg"),
+                    image_format="JPG",
+                    dimensions="100 × 100",
+                    size_text="1KB",
+                )
+            ]
+            page.original_save_radio.setChecked(True)
+            settings = PageSettings(
+                output_size=None,
+                output_choice="保持原格式",
+                quality=95,
+                apply_logo=False,
+                logo_assets=[],
+                watermark_options=None,
+            )
+
+            with patch.object(page, "_show_message") as show_message:
+                self.assertEqual(page._prepare_tasks(settings), [])
+
+            show_message.assert_called_once_with(
+                "warning",
+                "输出文件名过长，请缩短原文件名、LOGO 名称或文件名后缀",
             )
         finally:
             page.shutdown()

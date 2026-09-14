@@ -9,7 +9,6 @@ from unittest.mock import patch
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 import image_processor
-from blind_watermark_service import BlindWatermarkOptions
 from config import (
     DEFAULT_MANUAL_QUALITY,
     DEFAULT_REFERENCE_NOTICE_BACKGROUND_OPACITY,
@@ -51,7 +50,6 @@ def make_options(**overrides: object) -> ProcessOptions:
         "logos": [],
         "watermark_options": None,
         "reference_notice_options": None,
-        "blind_watermark_options": None,
         "quality": None,
     }
     values.update(overrides)
@@ -64,28 +62,28 @@ class ProcessOptionsTestCase(unittest.TestCase):
 
         self.assertEqual(options.quality, 95)
         self.assertIsNone(options.reference_notice_options)
-        self.assertIsNone(options.blind_watermark_options)
 
-    def test_blind_watermark_field_is_last_and_preserves_all_legacy_positions(self) -> None:
-        blind_watermark = BlindWatermarkOptions(
-            text="ownership",
-            password_image=2026,
-            password_watermark=2027,
-        )
-        options = ProcessOptions(
-            "JPG",
-            None,
-            False,
-            [],
-            None,
-            95,
-            None,
-            blind_watermark,
-        )
+    def test_visual_options_preserve_all_legacy_positions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            font_path = Path(temp_dir) / "font.ttf"
+            font_path.touch()
+            notice = ReferenceNoticeOptions("NOTICE", font_path)
+            watermark = WatermarkOptions(watermark_type="文字水印", text="WATERMARK")
+            options = ProcessOptions(
+                "PNG",
+                (320, 240),
+                False,
+                [],
+                watermark,
+                95,
+                notice,
+            )
 
+        self.assertEqual(options.output_format, "PNG")
+        self.assertEqual(options.output_size, (320, 240))
+        self.assertIs(options.watermark_options, watermark)
         self.assertEqual(options.quality, 95)
-        self.assertIsNone(options.reference_notice_options)
-        self.assertIs(options.blind_watermark_options, blind_watermark)
+        self.assertIs(options.reference_notice_options, notice)
 
     def test_quality_must_be_in_supported_range(self) -> None:
         for quality in (0, 101):
@@ -469,15 +467,10 @@ class ReferenceNoticePipelineTestCase(unittest.TestCase):
 
         return side_effect
 
-    def test_processing_order_is_visual_pipeline_blind_watermark_then_encoding(self) -> None:
+    def test_processing_order_is_visual_pipeline_then_encoding(self) -> None:
         steps: list[str] = []
         watermark = WatermarkOptions(watermark_type="test", position="not-bottom-right")
         notice = self.notice_options()
-        blind_watermark = BlindWatermarkOptions(
-            text="ownership",
-            password_image=2026,
-            password_watermark=2027,
-        )
         original_encode = image_processor._encode_working_image
 
         def encode(image: Image.Image, options: ProcessOptions):
@@ -500,11 +493,6 @@ class ReferenceNoticePipelineTestCase(unittest.TestCase):
                 "apply_reference_notice",
                 side_effect=self.record_step(steps, "reference_notice"),
             ),
-            patch.object(
-                image_processor,
-                "embed_blind_watermark",
-                side_effect=self.record_step(steps, "blind_watermark"),
-            ),
             patch.object(image_processor, "_encode_working_image", side_effect=encode),
         ):
             process_image(
@@ -515,7 +503,6 @@ class ReferenceNoticePipelineTestCase(unittest.TestCase):
                     logos=[Image.new("RGBA", (1, 1))],
                     watermark_options=watermark,
                     reference_notice_options=notice,
-                    blind_watermark_options=blind_watermark,
                 ),
             )
 
@@ -525,63 +512,69 @@ class ReferenceNoticePipelineTestCase(unittest.TestCase):
                 "logo",
                 "watermark",
                 "reference_notice",
-                "blind_watermark",
                 "encode",
             ],
         )
 
-    def test_blind_watermark_is_not_called_when_disabled(self) -> None:
-        with patch.object(image_processor, "embed_blind_watermark") as embed:
+    def test_optional_visual_steps_are_not_called_when_disabled(self) -> None:
+        with (
+            patch.object(image_processor, "overlay_logos") as overlay,
+            patch.object(image_processor, "apply_watermark") as watermark,
+            patch.object(image_processor, "apply_reference_notice") as notice,
+        ):
             process_image(
                 self.source,
-                self.root / "without-blind-watermark.jpg",
+                self.root / "without-overlays.jpg",
                 make_options(),
             )
 
-        embed.assert_not_called()
+        overlay.assert_not_called()
+        watermark.assert_not_called()
+        notice.assert_not_called()
 
-    def test_preview_paths_never_embed_blind_watermark(self) -> None:
-        blind_watermark = BlindWatermarkOptions(
-            text="preview must skip",
-            password_image=2026,
-            password_watermark=2027,
+    def test_preview_paths_apply_visual_options_without_writing_files(self) -> None:
+        source_bytes = self.source.read_bytes()
+        original_files = set(self.root.iterdir())
+        options = make_options(
+            output_format="PNG",
+            output_size=(160, 120),
+            apply_logo=True,
+            logos=[Image.new("RGBA", (2, 2), (25, 50, 75, 255))],
         )
-        options = make_options(blind_watermark_options=blind_watermark)
 
-        with patch.object(image_processor, "embed_blind_watermark") as embed:
-            preview = render_preview_image(self.source, options)
-            encoded_preview = render_encoded_preview_image(self.source, options)
+        preview = render_preview_image(self.source, options)
+        encoded_preview = render_encoded_preview_image(self.source, options)
 
-        embed.assert_not_called()
-        self.assertEqual(preview.size, (320, 240))
-        self.assertEqual(encoded_preview.image.size, (320, 240))
+        self.assertEqual(preview.size, (160, 120))
+        self.assertEqual(encoded_preview.image.size, (160, 120))
+        self.assertEqual(preview.getpixel((0, 0)), (25, 50, 75))
+        self.assertEqual(preview.tobytes(), encoded_preview.image.tobytes())
+        self.assertEqual(self.source.read_bytes(), source_bytes)
+        self.assertEqual(set(self.root.iterdir()), original_files)
 
-    def test_blind_watermark_failure_does_not_write_output(self) -> None:
+    def test_visual_processing_failure_does_not_write_output(self) -> None:
         target = self.root / "missing" / "failed-output.jpg"
-        blind_watermark = BlindWatermarkOptions(
-            text="ownership",
-            password_image=2026,
-            password_watermark=2027,
-        )
+        source_bytes = self.source.read_bytes()
 
         with (
             patch.object(
                 image_processor,
-                "embed_blind_watermark",
-                side_effect=RuntimeError("blind watermark failed"),
+                "apply_reference_notice",
+                side_effect=RuntimeError("visual processing failed"),
             ),
             patch.object(image_processor, "_encode_working_image") as encode,
         ):
-            with self.assertRaisesRegex(RuntimeError, "blind watermark failed"):
+            with self.assertRaisesRegex(RuntimeError, "visual processing failed"):
                 process_image(
                     self.source,
                     target,
-                    make_options(blind_watermark_options=blind_watermark),
+                    make_options(reference_notice_options=self.notice_options()),
                 )
 
         encode.assert_not_called()
         self.assertFalse(target.exists())
         self.assertFalse(target.parent.exists())
+        self.assertEqual(self.source.read_bytes(), source_bytes)
 
     def test_bottom_right_watermark_moves_above_notice(self) -> None:
         notice = self.notice_options()

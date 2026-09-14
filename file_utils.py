@@ -7,6 +7,12 @@ from pathlib import Path
 from config import SUPPORTED_EXTENSIONS
 
 
+MAX_FILENAME_SUFFIX_LENGTH = 64
+MAX_FILENAME_COMPONENT_UTF16_UNITS = 255
+INVALID_FILENAME_SUFFIX_CHARACTERS = frozenset('<>:"/\\|?*')
+DEFAULT_PROCESSED_FILENAME_SUFFIX = "已处理"
+
+
 def is_supported_image(path: str | Path) -> bool:
     return Path(path).suffix.lower() in SUPPORTED_EXTENSIONS
 
@@ -68,6 +74,12 @@ def ensure_suffix(path: Path, suffix: str) -> Path:
     return path
 
 
+def validate_filename_component(filename: str) -> None:
+    utf16_units = len(filename.encode("utf-16-le", errors="surrogatepass")) // 2
+    if utf16_units > MAX_FILENAME_COMPONENT_UTF16_UNITS:
+        raise ValueError("输出文件名过长，请缩短原文件名、LOGO 名称或文件名后缀")
+
+
 def ensure_unique_path(path: str | Path, reserved: set[str] | None = None) -> Path:
     if reserved is None:
         reserved = set()
@@ -77,20 +89,57 @@ def ensure_unique_path(path: str | Path, reserved: set[str] | None = None) -> Pa
     suffix = path.suffix
     index = 1
 
-    while candidate.exists() or normalize_reserved_path(candidate) in reserved:
+    while True:
+        validate_filename_component(candidate.name)
+        normalized_candidate = normalize_reserved_path(candidate)
+        if not candidate.exists() and normalized_candidate not in reserved:
+            break
         candidate = path.with_name(f"{base_name}_{index}{suffix}")
         index += 1
 
-    reserved.add(normalize_reserved_path(candidate))
+    reserved.add(normalized_candidate)
     return candidate
 
 
-def build_output_file_stem(source_path: str | Path, suffix_parts: Iterable[str] | None = None) -> str:
+def normalize_filename_suffix(value: str | None) -> str:
+    """Normalize a user-provided filename suffix without its separator."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("文件名后缀必须是文本")
+
+    stripped = value.strip()
+    normalized = stripped.lstrip("_").strip()
+    if stripped and not normalized:
+        raise ValueError("文件名后缀不能只包含下划线")
+    if len(normalized) > MAX_FILENAME_SUFFIX_LENGTH:
+        raise ValueError(f"文件名后缀不能超过 {MAX_FILENAME_SUFFIX_LENGTH} 个字符")
+    if any(
+        character in INVALID_FILENAME_SUFFIX_CHARACTERS or ord(character) < 32
+        for character in normalized
+    ):
+        raise ValueError('文件名后缀不能包含 \\ / : * ? " < > |')
+    if any(normalized.lower().endswith(extension) for extension in SUPPORTED_EXTENSIONS):
+        raise ValueError("文件名后缀无需填写图片扩展名")
+    if normalized.endswith("."):
+        raise ValueError("文件名后缀不能以句点结尾")
+    return normalized
+
+
+def build_output_file_stem(
+    source_path: str | Path,
+    suffix_parts: Iterable[str] | None = None,
+    custom_suffix: str | None = None,
+) -> str:
     source = Path(source_path)
-    parts = [part.strip() for part in (suffix_parts or []) if part and part.strip()]
+    normalized_custom_suffix = normalize_filename_suffix(custom_suffix)
+    if normalized_custom_suffix:
+        parts = [normalized_custom_suffix]
+    else:
+        parts = [part.strip() for part in (suffix_parts or []) if part and part.strip()]
     if parts:
         return f"{source.stem}_{'_'.join(parts)}"
-    return f"{source.stem}_已处理"
+    return f"{source.stem}_{DEFAULT_PROCESSED_FILENAME_SUFFIX}"
 
 
 def build_default_output_path(
@@ -99,11 +148,14 @@ def build_default_output_path(
     output_choice: str,
     reserved: set[str] | None = None,
     suffix_parts: Iterable[str] | None = None,
+    custom_suffix: str | None = None,
 ) -> Path:
     source = Path(source_path)
     output_format, suffix = resolve_output_format(output_choice, source)
     del output_format
-    target = Path(output_directory) / f"{build_output_file_stem(source, suffix_parts)}{suffix}"
+    target = Path(output_directory) / (
+        f"{build_output_file_stem(source, suffix_parts, custom_suffix)}{suffix}"
+    )
     return ensure_unique_path(target, reserved)
 
 

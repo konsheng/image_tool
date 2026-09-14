@@ -18,7 +18,6 @@ from config import (
     APP_AUTHOR,
     APP_NAME,
     APP_VERSION,
-    BLIND_WATERMARK_LICENSE_RELATIVE_PATH,
     PROJECT_ISSUES_URL,
     PROJECT_RELEASES_URL,
     PROJECT_URL,
@@ -74,14 +73,6 @@ class AboutPageTestCase(unittest.TestCase):
             self.assertEqual(
                 page.font_license_label.text(),
                 f"参考图提示字体：{REFERENCE_NOTICE_FONT_NAME} · Adobe · SIL OFL 1.1",
-            )
-            self.assertEqual(
-                page.blind_watermark_license_label.text(),
-                "盲水印组件：blind-watermark 0.4.4 · MIT License",
-            )
-            self.assertEqual(
-                page.blind_watermark_license_button.text(),
-                "查看开源许可",
             )
             self.assertEqual(page.support_title_label.text(), "帮助与支持")
             self.assertEqual(
@@ -230,43 +221,6 @@ class AboutPageTestCase(unittest.TestCase):
         finally:
             self.close_page(page)
 
-    def test_bundled_blind_watermark_license_is_available_from_about_page(self) -> None:
-        page = self.make_page()
-        try:
-            with (
-                patch("gui.resource_path") as resource_path,
-                patch("gui.OpenSourceLicenseDialog") as dialog_class,
-            ):
-                from importlib.metadata import distribution
-
-                license_path = distribution("blind-watermark").locate_file(
-                    BLIND_WATERMARK_LICENSE_RELATIVE_PATH
-                )
-                resource_path.return_value = Path(license_path)
-                QTest.mouseClick(
-                    page.blind_watermark_license_button,
-                    Qt.LeftButton,
-                )
-                self.process_events()
-
-            resource_path.assert_called_once_with(
-                BLIND_WATERMARK_LICENSE_RELATIVE_PATH
-            )
-            dialog_class.assert_called_once()
-            license_text = dialog_class.call_args.args[0]
-            self.assertIn("MIT License", license_text)
-            self.assertIn("Copyright", license_text)
-            self.assertEqual(
-                dialog_class.call_args.kwargs,
-                {
-                    "title": "盲水印组件许可",
-                    "summary": "blind-watermark 0.4.4 · MIT License",
-                },
-            )
-            dialog_class.return_value.exec.assert_called_once_with()
-        finally:
-            self.close_page(page)
-
     def test_missing_font_license_reports_an_error(self) -> None:
         page = self.make_page()
         try:
@@ -293,49 +247,6 @@ class AboutPageTestCase(unittest.TestCase):
             show_message.assert_called_once_with(
                 "error",
                 "开源字体许可证文件无法读取",
-            )
-        finally:
-            self.close_page(page)
-
-    def test_missing_blind_watermark_license_reports_an_error(self) -> None:
-        page = self.make_page()
-        try:
-            with (
-                patch("gui.resource_path") as resource_path,
-                patch.object(page, "_show_message") as show_message,
-            ):
-                resource_path.return_value = Path("missing-blind-watermark-license.txt")
-                page.blind_watermark_license_button.click()
-
-            resource_path.assert_called_once_with(
-                BLIND_WATERMARK_LICENSE_RELATIVE_PATH
-            )
-            show_message.assert_called_once_with(
-                "error",
-                "盲水印组件许可证文件缺失",
-            )
-        finally:
-            self.close_page(page)
-
-    def test_unreadable_blind_watermark_license_reports_an_error(self) -> None:
-        page = self.make_page()
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                invalid_license = Path(temp_dir) / "blind-watermark-LICENSE.txt"
-                invalid_license.write_bytes(b"\xff\xfe\xfa")
-                with (
-                    patch("gui.resource_path") as resource_path,
-                    patch.object(page, "_show_message") as show_message,
-                ):
-                    resource_path.return_value = invalid_license
-                    page.blind_watermark_license_button.click()
-
-            resource_path.assert_called_once_with(
-                BLIND_WATERMARK_LICENSE_RELATIVE_PATH
-            )
-            show_message.assert_called_once_with(
-                "error",
-                "盲水印组件许可证文件无法读取",
             )
         finally:
             self.close_page(page)

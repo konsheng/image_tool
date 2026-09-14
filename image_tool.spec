@@ -28,23 +28,6 @@ datas += qfluent_datas
 binaries += qfluent_binaries
 hiddenimports += qfluent_hiddenimports
 
-blind_watermark_datas, blind_watermark_binaries, blind_watermark_hiddenimports = collect_all(
-    "blind_watermark"
-)
-datas += blind_watermark_datas
-binaries += blind_watermark_binaries
-hiddenimports += blind_watermark_hiddenimports
-hiddenimports += [
-    "cv2",
-    "numpy",
-    "pywt",
-    "pywt._extensions._cwt",
-    "pywt._extensions._dwt",
-    "pywt._extensions._pywt",
-    "pywt._extensions._swt",
-]
-
-
 a = Analysis(
     ["main.py"],
     pathex=[],
@@ -54,7 +37,15 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["pytest", "_pytest"],
+    excludes=[
+        "pytest",
+        "_pytest",
+        "blind_watermark_service",
+        "blind_watermark",
+        "cv2",
+        "numpy",
+        "pywt",
+    ],
     noarchive=False,
     optimize=0,
 )

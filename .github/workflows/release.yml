@@ -53,7 +53,7 @@ jobs:
       - name: Compile source
         shell: pwsh
         run: |
-          python -m py_compile main.py gui.py image_processor.py blind_watermark_service.py compressor.py logo_manager.py file_utils.py memo_store.py config.py
+          python -m py_compile main.py gui.py image_processor.py compressor.py logo_manager.py file_utils.py memo_store.py config.py
 
       - name: Run tests
         shell: pwsh
@@ -79,12 +79,7 @@ jobs:
 
           Write-Host "Executable size: $([math]::Round($item.Length / 1MB, 2)) MB"
 
-          $selfTest = Start-Process -FilePath $exe -ArgumentList "--self-test-blind-watermark" -PassThru -Wait -WindowStyle Hidden
-          if ($selfTest.ExitCode -ne 0) {
-            throw "Frozen blind-watermark self-test failed with code $($selfTest.ExitCode)."
-          }
-
-          $archiveListing = (& pyi-archive_viewer --list --brief $exe 2>&1) | Out-String
+          $archiveListing = (& pyi-archive_viewer --recursive --brief $exe 2>&1) | Out-String
           if ($LASTEXITCODE -ne 0) {
             throw "Unable to inspect executable archive."
           }
@@ -92,15 +87,18 @@ jobs:
           $requiredEntries = @(
             "assets\fonts\SourceHanSansCN-Medium.otf",
             "assets\fonts\LICENSE.txt",
-            "assets\fonts\SOURCE.md",
-            "blind_watermark\blind_watermark.py",
-            "blind_watermark\bwm_core.py",
-            "blind_watermark-0.4.4.dist-info\LICENSE"
+            "assets\fonts\SOURCE.md"
           )
           foreach ($entry in $requiredEntries) {
             if (-not $archiveListing.Contains($entry)) {
               throw "Required bundled resource is missing from executable: $entry"
             }
+          }
+
+          $forbiddenPattern = '(?im)^\s*(?:blind_watermark_service|blind[_-]watermark|cv2|numpy|pywt|pywavelets|opencv[_-]python)(?:[\\/.\s-]|$)'
+          $forbiddenMatch = [regex]::Match($archiveListing, $forbiddenPattern)
+          if ($forbiddenMatch.Success) {
+            throw "Removed dependency is still bundled in executable: $($forbiddenMatch.Value.Trim())"
           }
 
           $process = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden
@@ -137,11 +135,6 @@ jobs:
           Copy-Item "README.md" "$packageDir\README.md"
           Copy-Item "assets\fonts\LICENSE.txt" "$packageDir\THIRD_PARTY_LICENSES\SourceHanSans-LICENSE.txt"
           Copy-Item "assets\fonts\SOURCE.md" "$packageDir\THIRD_PARTY_LICENSES\SourceHanSans-SOURCE.md"
-          $blindWatermarkLicense = python -c "from importlib.metadata import distribution; print(distribution('blind-watermark').locate_file('blind_watermark-0.4.4.dist-info/LICENSE'))"
-          if (-not (Test-Path $blindWatermarkLicense)) {
-            throw "blind-watermark license not found: $blindWatermarkLicense"
-          }
-          Copy-Item $blindWatermarkLicense "$packageDir\THIRD_PARTY_LICENSES\blind-watermark-LICENSE.txt"
           Compress-Archive -Path "$packageDir\*" -DestinationPath $zipPath -Force
 
           if (-not (Test-Path $zipPath)) {
