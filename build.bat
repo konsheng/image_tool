@@ -21,5 +21,7 @@ if not exist "assets\fonts\LICENSE.txt" (
 )
 
 python -m PyInstaller --noconfirm --clean image_tool.spec
+if errorlevel 1 exit /b %ERRORLEVEL%
+python tools\verify_windows_bundle.py "dist\图片处理工具.exe"
 set "build_exit_code=%ERRORLEVEL%"
 endlocal & exit /b %build_exit_code%

@@ -1,7 +1,27 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all
+
+
+if os.name == "nt":
+    # Qt uses Windows ICU. An unrelated tool's ICU on the inherited PATH can
+    # have the same DLL name with incompatible exports and break QtCore import.
+    # Resolve native dependencies from this Python install and Windows only;
+    # PyInstaller's package hooks add PySide6's own library directories.
+    windows_directory = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    os.environ["PATH"] = os.pathsep.join(
+        str(path)
+        for path in (
+            Path(sys.executable).resolve().parent,
+            Path(sys.base_prefix),
+            Path(sys.base_prefix) / "DLLs",
+            windows_directory / "System32",
+            windows_directory,
+        )
+    )
 
 
 datas = []

@@ -13,12 +13,14 @@ from PySide6.QtCore import (
     QPoint,
     QRect,
     QSettings,
+    QSignalBlocker,
     QSize,
     Qt,
     QThread,
     QTimer,
     QUrl,
     Signal,
+    Slot,
     QVariantAnimation,
 )
 from PySide6.QtGui import (
@@ -666,6 +668,7 @@ class PreviewWorker(QObject):
         super().__init__()
         self.request = request
 
+    @Slot()
     def run(self) -> None:
         request = self.request
         try:
@@ -744,6 +747,7 @@ class ProcessingWorker(QObject):
     def request_cancel(self) -> None:
         self.cancel_requested = True
 
+    @Slot()
     def run(self) -> None:
         total = len(self.tasks)
         success = 0
@@ -2063,6 +2067,8 @@ class ImageOperationPage(QWidget):
         self.preview_timer.stop()
         self.pending_preview_request = None
         self.preview_pending_ready = False
+        if self.processing_active:
+            return
         self._update_compression_controls_state()
 
         rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
@@ -2139,6 +2145,8 @@ class ImageOperationPage(QWidget):
         self.preview_timer.start()
 
     def _start_pending_preview(self) -> None:
+        if self.processing_active:
+            return
         self.preview_pending_ready = True
         if self.preview_thread is not None:
             return
@@ -2159,12 +2167,14 @@ class ImageOperationPage(QWidget):
         thread.started.connect(worker.run)
         worker.succeeded.connect(self._on_preview_succeeded)
         worker.failed.connect(self._on_preview_failed)
-        worker.finished.connect(thread.quit)
+        # quit() is thread-safe. Let the worker stop its own event loop even
+        # while the GUI is busy dispatching batch progress or closing a page.
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._on_preview_thread_finished)
         thread.start()
 
+    @Slot(int, object)
     def _on_preview_succeeded(self, request_id: int, outcome: object) -> None:
         if request_id != self.preview_request_serial or not isinstance(outcome, PreviewOutcome):
             return
@@ -2178,15 +2188,27 @@ class ImageOperationPage(QWidget):
             watermark_shifted=outcome.watermark_shifted,
         )
 
+    @Slot(int, str)
     def _on_preview_failed(self, request_id: int, reason: str) -> None:
         if request_id != self.preview_request_serial:
             return
         self._set_preview_message(self._preview_error_message(reason))
 
+    @Slot()
     def _on_preview_thread_finished(self) -> None:
+        thread = self.preview_thread
+        if thread is None:
+            return
+        # finished is emitted before all native thread cleanup completes.
+        # Keep Python wrappers alive until deferred worker deletion is done.
+        thread.wait()
         self.preview_worker = None
         self.preview_thread = None
         self.active_preview_request = None
+        thread.deleteLater()
+        if self.processing_active:
+            self._start_processing_worker()
+            return
         if self.pending_preview_request is None:
             return
         if self.preview_pending_ready:
@@ -2367,18 +2389,22 @@ class ImageOperationPage(QWidget):
 
     def _remove_selected(self, *_args) -> None:
         rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()}, reverse=True)
-        for row in rows:
-            self.table.removeRow(row)
-            del self.items[row]
         if rows:
+            # Row removal changes the selection synchronously. Refresh only
+            # after the table, backing list, and final selection agree.
+            with QSignalBlocker(self.table):
+                for row in rows:
+                    del self.items[row]
+                    self.table.removeRow(row)
+                if self.items:
+                    self.table.selectRow(min(rows[-1], len(self.items) - 1))
             self._reset_save_location()
-            if self.items:
-                self.table.selectRow(min(rows[-1], len(self.items) - 1))
             self._refresh_preview()
 
     def _clear_list(self, *_args) -> None:
-        self.items.clear()
-        self.table.setRowCount(0)
+        with QSignalBlocker(self.table):
+            self.items.clear()
+            self.table.setRowCount(0)
         self._reset_save_location()
         self._update_result_labels(0, 0, 0)
         self.progress_bar.setValue(0)
@@ -2546,6 +2572,8 @@ class ImageOperationPage(QWidget):
         return True
 
     def _start_processing(self, *_args) -> None:
+        if self.processing_active:
+            return
         if not self.items:
             self._show_message("warning", "请先导入图片")
             return
@@ -2569,6 +2597,7 @@ class ImageOperationPage(QWidget):
                 status_item.setToolTip("")
 
         self._set_processing_state(True)
+        self._refresh_preview()
         self._update_result_labels(len(tasks), 0, 0)
         self.progress_bar.setValue(0)
         self.progress_text.setText(f"总数：{len(tasks)}    当前：0/{len(tasks)}    文件：-")
@@ -2591,10 +2620,20 @@ class ImageOperationPage(QWidget):
         self.worker.output_committed.connect(self._forward_output_committed)
         self.worker.progress_changed.connect(self._on_progress_changed)
         self.worker.finished.connect(self._on_processing_finished)
-        self.worker.finished.connect(lambda *_: self.worker_thread.quit())
+        self.worker.finished.connect(self.worker_thread.quit, Qt.DirectConnection)
         self.worker.finished.connect(self.worker.deleteLater)
-        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
         self.worker_thread.finished.connect(self._clear_worker_refs)
+        self._start_processing_worker()
+
+    @Slot()
+    def _start_processing_worker(self) -> None:
+        if self.worker_thread is None or self.worker_thread.isRunning():
+            return
+        if self.preview_thread is not None:
+            # Drain an already-running preview without blocking the GUI.
+            # Its finished callback starts the batch once it has stopped.
+            self.preview_thread.quit()
+            return
         self.worker_thread.start()
 
     def _cancel_processing(self, *_args) -> None:
@@ -2606,6 +2645,7 @@ class ImageOperationPage(QWidget):
             self.progress_text.text() + "    正在取消（当前图片完成后停止）"
         )
 
+    @Slot(object)
     def _forward_output_committed(self, output: object) -> None:
         self.output_committed.emit(output)
 
@@ -3074,13 +3114,16 @@ class ImageOperationPage(QWidget):
         if processing:
             self.preview_image_label.set_drag_enabled(False)
 
+    @Slot(int, str)
     def _on_item_started(self, row: int, file_name: str) -> None:
         del file_name
         self._set_row_status(row, STATUS_PROCESSING)
 
+    @Slot(int, str)
     def _on_item_finished(self, row: int, status: str) -> None:
         self._set_row_status(row, status)
 
+    @Slot(int, int, str, int, int)
     def _on_progress_changed(
         self,
         current: int,
@@ -3094,6 +3137,7 @@ class ImageOperationPage(QWidget):
         self.progress_text.setText(f"总数：{total}    当前：{current}/{total}    文件：{file_name}")
         self._update_result_labels(total, success, failure)
 
+    @Slot(int, int, int, object, bool)
     def _on_processing_finished(
         self,
         total: int,
@@ -3115,9 +3159,15 @@ class ImageOperationPage(QWidget):
         else:
             self._show_message("success", "图片处理完成")
 
+    @Slot()
     def _clear_worker_refs(self) -> None:
+        thread = self.worker_thread
+        if thread is None:
+            return
+        thread.wait()
         self.worker = None
         self.worker_thread = None
+        thread.deleteLater()
         if self.processing_active:
             self._set_processing_state(False)
             self._refresh_preview()
@@ -3130,9 +3180,10 @@ class ImageOperationPage(QWidget):
         self.preview_pending_ready = False
 
         preview_thread = self.preview_thread
-        if preview_thread is not None and preview_thread.isRunning():
+        if preview_thread is not None:
             preview_thread.quit()
             preview_thread.wait()
+            preview_thread.deleteLater()
         self.preview_worker = None
         self.preview_thread = None
         self.active_preview_request = None
@@ -3140,9 +3191,10 @@ class ImageOperationPage(QWidget):
         if self.worker is not None:
             self.worker.request_cancel()
         processing_thread = self.worker_thread
-        if processing_thread is not None and processing_thread.isRunning():
+        if processing_thread is not None:
             processing_thread.quit()
             processing_thread.wait()
+            processing_thread.deleteLater()
         self.worker = None
         self.worker_thread = None
 
